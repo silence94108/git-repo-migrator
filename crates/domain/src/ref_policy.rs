@@ -18,17 +18,9 @@ pub enum RefPolicyDecision {
     Ignore,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefPolicy {
     pub include_archived_refs: bool,
-}
-
-impl Default for RefPolicy {
-    fn default() -> Self {
-        Self {
-            include_archived_refs: false,
-        }
-    }
 }
 
 impl RefPolicy {

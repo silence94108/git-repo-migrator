@@ -15,7 +15,7 @@
 |---|---|---|
 | 1 planning | completed | 2026-08-26 |
 | 2 review | completed | 2026-08-26 |
-| 3 dev+qa | pending | - |
+| 3 dev+qa | completed | 2026-08-26 |
 | 4 deploy | pending | - |
 
 ## Artifacts
@@ -35,7 +35,7 @@
 
 | gate | when | result | notes |
 |---|---|---|---|
-| Gate 0 | after dev | pending | typecheck, lint, unit/integration tests |
+| Gate 0 | after dev | passed | cargo workspace tests, strict clippy, TypeScript check, Vite build; real bare-repository Git fixture passed |
 | Gate 1 | after QA | pending | migration fixtures, E2E, no unresolved critical failures |
 | Gate 2 | before release | pending | Windows packaging, installer smoke test, security review |
 
@@ -50,3 +50,6 @@
 - 2026-08-26 stage-1 planning completed
 - 2026-08-26 stage-2 review completed; conditional pass, zero critical blockers
 - 2026-08-26 tasks.md and waves.json recorded; code dispatch awaits explicit user confirmation
+- 2026-08-26 Wave 3 started; platform-core, platform-generic and application artifacts implemented
+- 2026-08-26 Wave 3 evidence passed: Generic Git URL/script safety, immutable planning, queue/recovery/report contracts, bare-repository ref migration
+- 2026-08-26 Gate 0 passed; Windows bundle icon assets generated, signing/release checks remain in Wave 6

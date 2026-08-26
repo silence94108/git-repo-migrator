@@ -1,0 +1,15 @@
+[package]
+name = "git-repo-migrator-platform-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = "2"
+
+[lints]
+workspace = true

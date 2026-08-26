@@ -22,6 +22,5 @@
       "resizable": true
     }]
   },
-  "bundle": { "active": true, "targets": "all" }
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.ico", "icons/icon.png"] }
 }
-
