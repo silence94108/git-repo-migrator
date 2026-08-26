@@ -1,0 +1,11 @@
+/target/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/target/
+*.tsbuildinfo
+apps/desktop/vite.config.js
+apps/desktop/vite.config.d.ts
+*.log
+.env
+.env.*
+!.env.example

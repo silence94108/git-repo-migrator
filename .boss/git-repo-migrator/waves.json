@@ -1,0 +1,158 @@
+{
+  "feature": "git-repo-migrator",
+  "version": 1,
+  "preflight": {
+    "repo": "not_initialized",
+    "defaultBranch": "unknown",
+    "ci": "unknown",
+    "tests": "unknown",
+    "rust": "not_installed",
+    "npm": "broken_under_volta",
+    "evidence": [
+      ["git", "-C", "D:\\Desktop\\chang\\www\\git-repo-migrator", "status", "--short", "--branch"],
+      ["cargo", "--version"],
+      ["npm", "--version"]
+    ]
+  },
+  "waves": [
+    {
+      "id": "wave-1-domain",
+      "title": "Wave 1：工程骨架与领域契约",
+      "scope": "Rust workspace、Tauri/React manifests、MigrationPlan、RefPolicy、状态机、CapabilityMatrix、错误与 fidelity enum",
+      "tasks": ["T-001", "T-002", "T-003", "T-004", "T-005", "T-006"],
+      "writeSet": ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "apps/desktop/package.json", "apps/desktop/package-lock.json", "apps/desktop/src-tauri/tauri.conf.json", "apps/desktop/src-tauri/capabilities/default.json", "crates/domain/src/plan.rs", "crates/domain/src/ref_policy.rs", "crates/domain/src/task_state.rs", "crates/domain/src/capability.rs", "crates/domain/src/error.rs"],
+      "redTests": [
+        ["cargo", "test", "-p", "git-repo-migrator-domain", "--test", "ref_policy_contract"],
+        ["cargo", "test", "-p", "git-repo-migrator-domain", "task_state_rejects_illegal_transition"],
+        ["npm", "run", "typecheck", "--prefix", "apps/desktop"]
+      ],
+      "greenGates": [
+        ["cargo", "fmt", "--all", "--", "--check"],
+        ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "test", "-p", "git-repo-migrator-domain"],
+        ["npm", "run", "typecheck", "--prefix", "apps/desktop"]
+      ],
+      "contractRows": ["CM-001", "CM-002", "CM-003"],
+      "stopCondition": "若 Rust/npm 工具链不可用、RefPolicy 允许私有 refs/裸 mirror、状态或 fidelity enum 与 Contract Matrix 不一致，停止并修订契约。",
+      "status": "pending"
+    },
+    {
+      "id": "wave-2-storage-git",
+      "title": "Wave 2：SQLite、GitRunner 与 Workspace",
+      "scope": "SQLite migration、append-only checkpoint/lease、结构化 Git/LFS 子进程、refs 校验、磁盘/路径安全",
+      "tasks": ["T-007", "T-008", "T-009", "T-010", "T-011"],
+      "writeSet": ["migrations/0001_initial.sql", "crates/local-store/src", "crates/git-runner/src", "crates/workspace/src", "tests/integration/git_refs_migration.rs"],
+      "redTests": [
+        ["cargo", "test", "-p", "git-repo-migrator-local-store", "--test", "recovery_contract"],
+        ["cargo", "test", "-p", "git-repo-migrator-git-runner", "--test", "git_refs_migration"],
+        ["cargo", "test", "-p", "git-repo-migrator-workspace", "--test", "workspace_safety"]
+      ],
+      "greenGates": [
+        ["cargo", "test", "-p", "git-repo-migrator-local-store"],
+        ["cargo", "test", "-p", "git-repo-migrator-git-runner"],
+        ["cargo", "test", "-p", "git-repo-migrator-workspace"],
+        ["cargo", "test", "--test", "git_refs_migration"],
+        ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+      ],
+      "contractRows": ["CM-001", "CM-004", "CM-007"],
+      "stopCondition": "migration 不可重复升级、checkpoint 可被更新/删除、lease 可被非 owner 提交、secret 进入 Git argv/log 或私有 refs 被推送时停止。",
+      "status": "pending"
+    },
+    {
+      "id": "wave-3-generic-orchestration",
+      "title": "Wave 3：Generic Git 主路径与恢复编排",
+      "scope": "PlatformAdapter/HttpTransport、Generic Git URL/创建脚本沙箱、选择映射预检、队列编排、LFS/验证/报告",
+      "tasks": ["T-012", "T-013", "T-014", "T-015", "T-016"],
+      "writeSet": ["crates/platform-core/src", "crates/platform-generic/src", "crates/application/src", "tests/integration/generic_migration_flow.rs"],
+      "redTests": [
+        ["cargo", "test", "-p", "git-repo-migrator-platform-generic", "--lib", "generic_requires_explicit_creation"],
+        ["cargo", "test", "-p", "git-repo-migrator-application", "--test", "planning_contract"],
+        ["cargo", "test", "-p", "git-repo-migrator-application", "--test", "orchestrator_faults"],
+        ["cargo", "test", "--test", "generic_migration_flow"]
+      ],
+      "greenGates": [
+        ["cargo", "test", "-p", "git-repo-migrator-platform-core"],
+        ["cargo", "test", "-p", "git-repo-migrator-platform-generic"],
+        ["cargo", "test", "-p", "git-repo-migrator-application"],
+        ["cargo", "test", "--test", "generic_migration_flow"],
+        ["cargo", "fmt", "--all", "--", "--check"]
+      ],
+      "contractRows": ["CM-005", "CM-006", "CM-007", "CM-008", "CM-010", "CM-011"],
+      "stopCondition": "Generic Git 无 API 时未阻断/未要求显式脚本，恢复重复创建或写入，LFS/平台部分失败被误报完整成功，或计划未冻结即执行时停止。",
+      "status": "pending"
+    },
+    {
+      "id": "wave-4-adapters-security",
+      "title": "Wave 4：凭据、平台适配器与 fidelity",
+      "scope": "Windows Credential Manager、GitHub/GitLab/Gitea/Forgejo/Gitee 适配器、能力探测、平台模块归档与部分重试",
+      "tasks": ["T-017", "T-018", "T-019", "T-020", "T-021", "T-022"],
+      "writeSet": ["crates/credential-store/src", "crates/platform-github/src", "crates/platform-gitlab/src", "crates/platform-gitea/src", "crates/platform-gitee/src", "crates/application/src/platform_modules.rs", "crates/application/src/archive.rs", "apps/desktop/src/generated/ipc.ts"],
+      "redTests": [
+        ["cargo", "test", "-p", "git-repo-migrator-credential-store", "--test", "secret_boundary"],
+        ["cargo", "test", "--test", "github_adapter"],
+        ["cargo", "test", "--test", "gitlab_adapter"],
+        ["cargo", "test", "--test", "gitea_gitee_adapters"],
+        ["cargo", "test", "--test", "platform_fidelity"]
+      ],
+      "greenGates": [
+        ["cargo", "test", "-p", "git-repo-migrator-credential-store"],
+        ["cargo", "test", "--test", "github_adapter"],
+        ["cargo", "test", "--test", "gitlab_adapter"],
+        ["cargo", "test", "--test", "gitea_gitee_adapters"],
+        ["cargo", "test", "--test", "platform_fidelity"],
+        ["cargo", "test", "--test", "ipc_schema_contract"]
+      ],
+      "contractRows": ["CM-003", "CM-004", "CM-008", "CM-009", "CM-011"],
+      "stopCondition": "任何 secret 泄漏、能力矩阵缺 supported/permitted/scopes/version/reason/degradation/fidelity、归档伪装 native、适配器绕过 RefPolicy 或限流契约漂移时停止。",
+      "status": "pending"
+    },
+    {
+      "id": "wave-5-gui",
+      "title": "Wave 5：Tauri IPC 与六步 GUI",
+      "scope": "受控 commands/events、SQLite snapshot 状态源、connections/repositories/mapping/preflight/queue/report 六页及可访问性",
+      "tasks": ["T-023", "T-024", "T-025", "T-026", "T-027", "T-028", "T-029"],
+      "writeSet": ["apps/desktop/src-tauri/src", "apps/desktop/src/router.tsx", "apps/desktop/src/components", "apps/desktop/src/styles/tokens.css", "apps/desktop/src/features"],
+      "redTests": [
+        ["npm", "run", "test", "--prefix", "apps/desktop", "--", "src/features/connection/ConnectionView.test.tsx"],
+        ["npm", "run", "test", "--prefix", "apps/desktop", "--", "src/features/discovery/DiscoveryView.test.tsx"],
+        ["npm", "run", "test", "--prefix", "apps/desktop", "--", "src/features/planning/PlanningViews.test.tsx"],
+        ["npm", "run", "test", "--prefix", "apps/desktop", "--", "src/features/queue/QueueView.test.tsx"],
+        ["npm", "run", "test", "--prefix", "apps/desktop", "--", "src/features/report/ReportView.test.tsx"]
+      ],
+      "greenGates": [
+        ["cargo", "test", "-p", "git-repo-migrator-desktop"],
+        ["npm", "run", "typecheck", "--prefix", "apps/desktop"],
+        ["npm", "run", "test", "--prefix", "apps/desktop"],
+        ["npm", "run", "build", "--prefix", "apps/desktop"]
+      ],
+      "contractRows": ["CM-001", "CM-002", "CM-003", "CM-004", "CM-005", "CM-006", "CM-007", "CM-008", "CM-009", "CM-012"],
+      "stopCondition": "renderer 可执行任意 shell/读取 secret、事件丢失无法从 SQLite 校正、危险操作只由 UI 控制、fidelity/冲突状态或路由与后端 schema 不一致、关键文本重叠/不可访问时停止。",
+      "status": "pending"
+    },
+    {
+      "id": "wave-6-windows-release",
+      "title": "Wave 6：Windows E2E、CI 与发布门禁",
+      "scope": "Windows GUI 主流程、故障/限流/安全/100 仓库容量、CI、签名安装包与发布清单",
+      "tasks": ["T-030", "T-031", "T-032"],
+      "writeSet": ["apps/desktop/playwright.config.ts", "tests/e2e", ".github/workflows/windows-ci.yml", ".github/workflows/windows-release.yml", "docs/release-checklist.md"],
+      "redTests": [
+        ["npx", "playwright", "test", "tests/e2e/migration-main-flow.spec.ts"],
+        ["npx", "playwright", "test", "tests/e2e/recovery-and-rate-limit.spec.ts"],
+        ["npx", "playwright", "test", "tests/e2e/security-boundary.spec.ts"],
+        ["npx", "playwright", "test", "tests/e2e/batch-100-repositories.spec.ts"]
+      ],
+      "greenGates": [
+        ["npx", "playwright", "test", "tests/e2e/migration-main-flow.spec.ts"],
+        ["npx", "playwright", "test", "tests/e2e/recovery-and-rate-limit.spec.ts"],
+        ["npx", "playwright", "test", "tests/e2e/security-boundary.spec.ts"],
+        ["npx", "playwright", "test", "tests/e2e/batch-100-repositories.spec.ts"],
+        ["cargo", "test", "--workspace"],
+        ["npm", "run", "typecheck", "--prefix", "apps/desktop"],
+        ["npm", "run", "build", "--prefix", "apps/desktop"]
+      ],
+      "contractRows": ["CM-001", "CM-002", "CM-003", "CM-004", "CM-005", "CM-006", "CM-007", "CM-008", "CM-009", "CM-010", "CM-011", "CM-012"],
+      "stopCondition": "Windows 10/11 主流程、100 仓库筛选、恢复/429、secret 边界、RefPolicy、报告脱敏、签名校验或 Git/LFS 分发许可任一未通过，禁止发布。",
+      "status": "pending"
+    }
+  ]
+}

@@ -1,0 +1,196 @@
+{
+  "schemaVersion": "1.0.0",
+  "artifact": "ui-design",
+  "mode": "wireframe",
+  "feature": "Git Repo Migrator",
+  "updatedAt": "2026-08-26T00:00:00Z",
+  "tokens": {
+    "colors": {
+      "primary": "#2563EB",
+      "primaryHover": "#1D4ED8",
+      "primaryLight": "#DBEAFE",
+      "bg": "#FFFFFF",
+      "surface": "#F9FAFB",
+      "surfaceMuted": "#F3F4F6",
+      "text": "#111827",
+      "textSecondary": "#4B5563",
+      "textMuted": "#6B7280",
+      "border": "#D1D5DB",
+      "success": "#047857",
+      "successBg": "#D1FAE5",
+      "warning": "#B45309",
+      "warningBg": "#FEF3C7",
+      "error": "#B91C1C",
+      "errorBg": "#FEE2E2",
+      "info": "#1D4ED8",
+      "infoBg": "#DBEAFE"
+    },
+    "typography": {
+      "fontUi": "Segoe UI, Microsoft YaHei, sans-serif",
+      "fontMono": "Cascadia Code, Consolas, monospace",
+      "title": { "size": 24, "lineHeight": 32, "weight": 600 },
+      "section": { "size": 16, "lineHeight": 24, "weight": 600 },
+      "body": { "size": 14, "lineHeight": 20, "weight": 400 },
+      "caption": { "size": 12, "lineHeight": 16, "weight": 400 }
+    },
+    "spacing": { "1": 4, "2": 8, "3": 12, "4": 16, "5": 20, "6": 24, "8": 32, "10": 40 },
+    "radius": { "sm": 4, "md": 6, "lg": 8 },
+    "breakpoints": { "mobile": 768, "tablet": 1024, "desktop": 1025 }
+  },
+  "pages": [
+    {
+      "id": "connections",
+      "name": "连接",
+      "route": "/connections",
+      "viewport": { "width": 1440, "height": 900 },
+      "layout": { "type": "appShell", "sidebar": 224, "toolbar": 56, "main": "twoColumn" },
+      "frames": [
+        { "id": "privacy-banner", "type": "alert", "text": "数据仅在本机处理", "requirementIds": ["FR-011", "NFR-003"] },
+        { "id": "source-connection", "type": "connectionPanel", "title": "源平台", "fields": ["platform", "baseUrl", "authMethod", "credentialRef", "testConnection"], "requirementIds": ["FR-001", "FR-012"] },
+        { "id": "target-connection", "type": "connectionPanel", "title": "目标平台", "fields": ["platform", "baseUrl", "authMethod", "credentialRef", "testConnection"], "requirementIds": ["FR-001", "FR-005"] },
+        { "id": "capability-summary", "type": "permissionMatrix", "states": ["discover", "create", "gitWrite", "platformWrite", "unsupported"], "requirementIds": ["FR-001", "FR-002"] }
+      ],
+      "states": ["empty", "loading", "connected", "invalidCredentials", "unreachable", "certificateWarning"]
+    },
+    {
+      "id": "repository-selection",
+      "name": "选择仓库",
+      "route": "/repositories",
+      "viewport": { "width": 1440, "height": 900 },
+      "layout": { "type": "appShell", "sidebar": 224, "toolbar": 56, "main": "table" },
+      "frames": [
+        { "id": "scope-bar", "type": "toolbar", "controls": ["accountOrOrganization", "refresh", "manualUrlImport"], "requirementIds": ["FR-002", "FR-012"] },
+        { "id": "filter-bar", "type": "filterBar", "filters": ["name", "organization", "visibility", "updatedAt", "permission"], "requirementIds": ["FR-003", "US-001"] },
+        { "id": "selection-banner", "type": "bulkSelectionBanner", "actions": ["selectAllFiltered", "addExclusionRule", "viewExcluded"], "requirementIds": ["FR-003", "US-001"] },
+        { "id": "repository-table", "type": "dataTable", "columns": ["select", "repository", "permission", "visibility", "updatedAt", "gitCapability", "platformCapability", "targetStatus"], "virtualized": true, "requirementIds": ["FR-002", "FR-003", "NFR-001"] },
+        { "id": "selection-summary", "type": "summaryPanel", "metrics": ["finalPlan", "fullMigration", "gitOnly", "blocked"], "requirementIds": ["FR-003", "FR-004"] }
+      ],
+      "states": ["loading", "ready", "filtering", "allSelected", "excluded", "partialLoadError", "noResults", "noPermission"]
+    },
+    {
+      "id": "mapping-strategy",
+      "name": "映射与策略",
+      "route": "/mapping",
+      "viewport": { "width": 1440, "height": 900 },
+      "layout": { "type": "appShell", "sidebar": 224, "toolbar": 56, "main": "mappingWithPreview" },
+      "frames": [
+        { "id": "target-scope", "type": "mappingControls", "controls": ["targetOrganization", "nameTemplate", "visibility"], "requirementIds": ["FR-003", "FR-005"] },
+        { "id": "module-selection", "type": "moduleChecklist", "required": ["gitHistory", "branches", "tags"], "optional": ["lfs", "submoduleCheck", "metadata", "issues", "pullRequests", "wiki", "releases", "attachments"], "requirementIds": ["FR-006", "FR-007", "FR-008"], "refPolicy": { "mode": "allowlist", "default": "gitHeadsTagsOnly", "options": ["gitHeadsTagsOnly", "includeReadOnlyArchiveRefs", "customAllowlist"], "exclude": ["platformPrivateRefs", "remoteTrackingRefs"], "explanation": "默认只迁移 heads 和 tags；平台私有 refs 不迁移，避免把平台内部状态写入目标。" }, "fidelity": { "field": "moduleFidelity", "enum": ["native_rebuild", "read_only_archive", "unsupported"], "defaultByCapability": { "apiRebuildable": "native_rebuild", "readableOnly": "read_only_archive", "noStableApiOrPermission": "unsupported" }, "userConfirmation": { "read_only_archive": "确认仅在本地报告/归档保存原文、源链接、身份和状态摘要，不向目标写入", "unsupported": "确认跳过该模块并继续其他模块" }, "partialSuccessImpact": "native_rebuild 逐项校验；read_only_archive 计入部分完成并提供归档路径；unsupported 不阻断 Git 数据但标记未迁移" } },
+        { "id": "conflict-strategy", "type": "radioGroup", "options": ["reuseEmptySkipNonEmpty", "autoRename", "continueSync", "overwrite"], "dangerConfirmation": true, "requirementIds": ["FR-005", "US-002"] },
+        { "id": "mapping-table", "type": "mappingTable", "columns": ["sourceUrl", "targetUrl", "targetName", "action", "targetStatus", "metadataPreview", "moduleStatus"], "requirementIds": ["FR-003", "FR-005", "FR-007"], "refPolicySummary": "每个仓库展示 heads/tags 白名单、归档 refs 选项和被排除平台私有 refs。" }
+      ],
+      "states": ["draft", "previewing", "nameConflict", "unsupportedModule", "dangerConfirmation", "invalidTemplate", "emptyPlan"]
+    },
+    {
+      "id": "preflight",
+      "name": "预检",
+      "route": "/preflight",
+      "viewport": { "width": 1440, "height": 900 },
+      "layout": { "type": "appShell", "sidebar": 224, "toolbar": 56, "main": "summaryAndTable" },
+      "frames": [
+        { "id": "preflight-summary", "type": "metricStrip", "metrics": ["total", "executable", "blocked", "warnings", "create", "reuse", "skip"], "requirementIds": ["FR-004", "FR-005"] },
+        { "id": "preflight-table", "type": "dataTable", "columns": ["repository", "action", "permission", "targetStatus", "moduleCapability", "moduleFidelity", "diskEstimate", "blockingReason", "suggestedAction"], "fidelityValues": ["native_rebuild", "read_only_archive", "unsupported"], "fidelityConfirmationRequired": ["read_only_archive", "unsupported"], "requirementIds": ["FR-004", "FR-005", "FR-008"] },
+        { "id": "field-mapping-drawer", "type": "drawer", "fields": ["description", "homepage", "topics", "defaultBranch", "visibility"], "requirementIds": ["FR-007"] },
+        { "id": "start-migration", "type": "button", "enabledWhen": "blocked == 0 && safetyAcknowledged", "requirementIds": ["FR-004", "NFR-003"] }
+      ],
+      "states": ["notGenerated", "running", "ready", "blocked", "warning", "apiError", "staleSnapshot", "fidelityConfirmationRequired"]
+    },
+    {
+      "id": "migration-queue",
+      "name": "迁移队列",
+      "route": "/queue",
+      "viewport": { "width": 1440, "height": 900 },
+      "layout": { "type": "appShell", "sidebar": 224, "toolbar": 56, "main": "queueTable" },
+      "frames": [
+        { "id": "task-toolbar", "type": "taskToolbar", "controls": ["overallProgress", "rate", "eta", "concurrency", "pause", "resume", "cancel"], "requirementIds": ["FR-009", "NFR-002"] },
+        { "id": "queue-table", "type": "queueTable", "columns": ["repository", "stage", "status", "progress", "retryCount", "checkpoint", "targetUrl", "duration"], "stages": ["preflight", "prepareTarget", "git", "lfs", "metadata", "platformData", "verify", "complete"], "requirementIds": ["FR-006", "FR-009"] },
+        { "id": "queue-filters", "type": "filterBar", "filters": ["status", "stage", "errorCode"], "actions": ["retryRetryable", "exportFiltered"], "requirementIds": ["FR-009", "FR-010"] },
+        { "id": "log-drawer", "type": "logDrawer", "filters": ["repository", "stage", "level", "errorCode"], "redact": ["token", "password", "privateKey"], "requirementIds": ["FR-009", "FR-011"] },
+        { "id": "resume-dialog", "type": "dialog", "options": ["continue", "saveAsNewBatch", "discardTempData"], "requirementIds": ["FR-009", "NFR-002"] }
+      ],
+      "states": ["queued", "running", "paused", "retrying", "retryableFailure", "partialFailure", "cancelled", "restoring"]
+    },
+    {
+      "id": "report",
+      "name": "报告",
+      "route": "/report",
+      "viewport": { "width": 1440, "height": 900 },
+      "layout": { "type": "appShell", "sidebar": 224, "toolbar": 56, "main": "metricsAndTable" },
+      "frames": [
+        { "id": "result-summary", "type": "metricStrip", "metrics": ["completeSuccess", "gitSuccessPlatformPartial", "retryableFailure", "permissionOrConflictSkip"], "requirementIds": ["FR-010"] },
+        { "id": "result-table", "type": "dataTable", "columns": ["sourceUrl", "targetUrl", "status", "completedAt", "gitVerification", "lfsVerification", "metadata", "platformModules", "moduleFidelity", "errorCode"], "fidelityValues": ["native_rebuild", "read_only_archive", "unsupported"], "partialSuccessRule": "read_only_archive 或任一模块失败时显示 Git 数据成功但平台数据部分失败；unsupported 显示未迁移原因", "requirementIds": ["FR-010", "US-005"] },
+        { "id": "evidence-drawer", "type": "drawer", "details": ["refHashComparison", "objectCounts", "unmappedFields", "moduleFidelity", "archivePath", "sourceLinks", "nextAction"], "requirementIds": ["FR-006", "FR-007", "FR-008", "FR-010"] },
+        { "id": "export-actions", "type": "buttonGroup", "actions": ["exportJson", "exportCsv", "exportMapping"], "requirementIds": ["FR-010", "FR-011"] },
+        { "id": "cleanup-alert", "type": "alert", "variants": ["cleaned", "retainedTempDirectory", "cleanupFailed"], "requirementIds": ["FR-011"] }
+      ],
+      "states": ["inProgress", "complete", "partial", "retryable", "skipped", "verificationUnavailable", "exportError", "empty"]
+    }
+  ],
+  "components": [
+    {
+      "id": "button",
+      "name": "Button",
+      "variants": ["primary", "secondary", "ghost", "danger", "link"],
+      "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "empty"],
+      "tokens": { "height": "control-md", "radius": "radius-md", "spacing": "space-3" },
+      "accessibility": { "keyboard": true, "ariaBusyOnLoading": true, "focusVisible": true }
+    },
+    {
+      "id": "input",
+      "name": "Input",
+      "variants": ["text", "password", "search", "textarea", "url"],
+      "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "empty"],
+      "tokens": { "height": "control-md", "radius": "radius-md", "border": "color-border" },
+      "accessibility": { "labelRequired": true, "errorDescribedBy": true }
+    },
+    {
+      "id": "selectionTable",
+      "name": "DataTable",
+      "variants": ["repository", "mapping", "queue", "result"],
+      "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "empty"],
+      "tokens": { "rowHeight": "control-row", "headerBackground": "color-surface-muted", "selectedBackground": "color-primary-100" },
+      "behavior": { "virtualScrollOver": 1000, "fixedFirstColumn": true, "globalSelectionCount": true, "keyboardRowNavigation": true },
+      "accessibility": { "role": "grid", "ariaRowCount": true, "statusNotColorOnly": true }
+    },
+    {
+      "id": "statusBadge",
+      "name": "StatusBadge",
+      "variants": ["success", "warning", "error", "retryable", "skipped", "unsupported", "running", "paused"],
+      "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "empty"],
+      "behavior": { "textAndIconRequired": true }
+    },
+    {
+      "id": "drawerDialog",
+      "name": "DrawerDialog",
+      "variants": ["details", "log", "dangerConfirmation", "resume"],
+      "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "empty"],
+      "accessibility": { "focusTrap": true, "escapeCloses": true, "restoreFocus": true }
+    },
+    {
+      "id": "stepper",
+      "name": "MigrationStepper",
+      "variants": ["completed", "current", "locked", "error"],
+      "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "empty"],
+      "steps": ["connections", "repository-selection", "mapping-strategy", "preflight", "migration-queue", "report"]
+    }
+  ],
+  "prototype": {
+    "startPageId": "connections",
+    "links": [
+      { "from": "connections", "to": "repository-selection", "trigger": "bothConnectionsTested", "condition": "source.connected && target.connected" },
+      { "from": "repository-selection", "to": "mapping-strategy", "trigger": "continue", "condition": "finalPlan > 0" },
+      { "from": "mapping-strategy", "to": "preflight", "trigger": "runPreflight", "condition": "mappingValid" },
+      { "from": "preflight", "to": "migration-queue", "trigger": "startMigration", "condition": "blocked == 0 && safetyAcknowledged" },
+      { "from": "migration-queue", "to": "report", "trigger": "queueCompleted" },
+      { "from": "migration-queue", "to": "migration-queue", "trigger": "retryRetryable", "condition": "selected.status == retryableFailure" },
+      { "from": "report", "to": "migration-queue", "trigger": "retryFromReport", "condition": "selected.status == retryableFailure" }
+    ]
+  },
+  "implementationHints": {
+    "preferredFramework": null,
+    "requiredComponents": ["AppShell", "MigrationStepper", "ConnectionPanel", "FilterBar", "BulkSelectionBanner", "DataTable", "MappingTable", "PreflightSummary", "QueueTable", "LogDrawer", "ReportTable", "Drawer", "Dialog"],
+    "accessibilityNotes": ["正文对比度至少4.5:1", "所有交互元素可通过Tab访问", "进度区域使用aria-live=polite，阻断错误使用aria-live=assertive", "状态必须同时显示文字和图标", "支持键盘方向键操作表格", "尊重系统减少动效偏好"],
+    "responsiveBehavior": { "mobile": "sidebarToTopStepper; tablesBecomeExpandableRows; filtersInDrawer", "tablet": "collapseSecondaryColumns; detailsInDrawer", "desktop": "persistentSidebar; splitDetailsAndTable" },
+    "dataEdgeCases": ["100到1000条仓库使用虚拟滚动", "长URL表格省略但详情显示完整值", "部分接口失败保留已加载结果", "目标状态未知时禁止默认执行", "空列表必须提供下一步动作"]
+  }
+}
