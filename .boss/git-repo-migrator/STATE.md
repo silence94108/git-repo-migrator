@@ -53,3 +53,5 @@
 - 2026-08-26 Wave 3 started; platform-core, platform-generic and application artifacts implemented
 - 2026-08-26 Wave 3 evidence passed: Generic Git URL/script safety, immutable planning, queue/recovery/report contracts, bare-repository ref migration
 - 2026-08-26 Gate 0 passed; Windows bundle icon assets generated, signing/release checks remain in Wave 6
+- 2026-08-27 Wave 4 completed; Windows Credential Manager boundary, GitHub/GitLab/Gitea/Forgejo/Gitee adapters, generated IPC contract, fidelity archive and failed-item retry implemented
+- 2026-08-27 Wave 4 evidence passed: secret boundary, adapter pagination/permissions/rate limit/version/private refs, IPC drift, platform fidelity, workspace tests, strict clippy, TypeScript check and Vite production build
