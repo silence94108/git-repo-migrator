@@ -271,6 +271,7 @@ pub struct MetadataPatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformModule {
+    Metadata,
     Issues,
     PullRequests,
     MergeRequests,
@@ -357,27 +358,39 @@ impl From<TransportError> for PlatformError {
                 message,
                 retry_after,
             } => {
-                let rate_limited = status == 429;
+                let (code, category, action) = match status {
+                    401 => (
+                        "platform.auth",
+                        PlatformErrorCategory::Auth,
+                        "请更新或重新授权凭据",
+                    ),
+                    403 => (
+                        "platform.permission",
+                        PlatformErrorCategory::Permission,
+                        "请授予所需最小权限后重试",
+                    ),
+                    409 => (
+                        "platform.conflict",
+                        PlatformErrorCategory::Conflict,
+                        "请检查目标资源状态和冲突策略",
+                    ),
+                    429 => (
+                        "platform.rate_limited",
+                        PlatformErrorCategory::RateLimited,
+                        "请等待限流窗口结束后重试",
+                    ),
+                    _ => (
+                        "platform.http",
+                        PlatformErrorCategory::Network,
+                        "请稍后重试",
+                    ),
+                };
                 Self {
-                    code: if rate_limited {
-                        "platform.rate_limited"
-                    } else {
-                        "platform.http"
-                    }
-                    .into(),
-                    category: if rate_limited {
-                        PlatformErrorCategory::RateLimited
-                    } else {
-                        PlatformErrorCategory::Network
-                    },
+                    code: code.into(),
+                    category,
                     retryable: status == 408 || status == 429 || status >= 500,
                     safe_message: message,
-                    action: if rate_limited {
-                        "请等待限流窗口结束后重试"
-                    } else {
-                        "请稍后重试"
-                    }
-                    .into(),
+                    action: action.into(),
                     retry_after_seconds: retry_after.map(|duration| duration.as_secs()),
                 }
             }
@@ -533,6 +546,23 @@ mod tests {
         assert_eq!(error.category, PlatformErrorCategory::RateLimited);
         assert!(error.retryable);
         assert_eq!(error.retry_after_seconds, Some(17));
+    }
+
+    #[test]
+    fn http_auth_permission_and_conflict_are_classified() {
+        for (status, category) in [
+            (401, PlatformErrorCategory::Auth),
+            (403, PlatformErrorCategory::Permission),
+            (409, PlatformErrorCategory::Conflict),
+        ] {
+            let error = PlatformError::from(TransportError::Http {
+                status,
+                message: "safe".into(),
+                retry_after: None,
+            });
+            assert_eq!(error.category, category);
+            assert!(!error.retryable);
+        }
     }
 
     #[test]
