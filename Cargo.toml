@@ -1,6 +1,12 @@
+[package]
+name = "git-repo-migrator-contracts"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/local-store", "crates/git-runner", "crates/workspace", "crates/platform-core", "crates/platform-generic", "crates/application", "apps/desktop/src-tauri"]
+members = ["crates/domain", "crates/local-store", "crates/git-runner", "crates/workspace", "crates/platform-core", "crates/platform-generic", "crates/application", "crates/credential-store", "crates/platform-github", "crates/platform-gitlab", "crates/platform-gitea", "crates/platform-gitee", "apps/desktop/src-tauri"]
 
 [workspace.package]
 edition = "2021"
@@ -12,3 +18,36 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "deny"
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
+git-repo-migrator-application = { path = "crates/application" }
+git-repo-migrator-domain = { path = "crates/domain" }
+git-repo-migrator-platform-core = { path = "crates/platform-core" }
+git-repo-migrator-platform-github = { path = "crates/platform-github" }
+git-repo-migrator-platform-gitlab = { path = "crates/platform-gitlab" }
+git-repo-migrator-platform-gitea = { path = "crates/platform-gitea" }
+git-repo-migrator-platform-gitee = { path = "crates/platform-gitee" }
+serde_json = "1"
+sha2 = "0.10"
+
+[[test]]
+name = "github_adapter"
+path = "tests/contract/github_adapter.rs"
+
+[[test]]
+name = "gitlab_adapter"
+path = "tests/contract/gitlab_adapter.rs"
+
+[[test]]
+name = "gitea_gitee_adapters"
+path = "tests/contract/gitea_gitee_adapters.rs"
+
+[[test]]
+name = "ipc_schema_contract"
+path = "tests/contract/ipc_schema_contract.rs"
+
+[[test]]
+name = "platform_fidelity"
+path = "tests/integration/platform_fidelity.rs"
