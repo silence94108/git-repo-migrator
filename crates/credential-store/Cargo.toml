@@ -1,0 +1,12 @@
+[package]
+name = "git-repo-migrator-credential-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+git-repo-migrator-platform-core = { path = "../platform-core" }
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[lints]
+workspace = true
