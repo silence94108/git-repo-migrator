@@ -11,5 +11,23 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+git-repo-migrator-application = { path = "../../../crates/application" }
+git-repo-migrator-domain = { path = "../../../crates/domain" }
+git-repo-migrator-git-runner = { path = "../../../crates/git-runner" }
+git-repo-migrator-local-store = { path = "../../../crates/local-store" }
+git-repo-migrator-platform-core = { path = "../../../crates/platform-core" }
+git-repo-migrator-platform-generic = { path = "../../../crates/platform-generic" }
+# Must stay on the same version as `crates/local-store`, otherwise `LocalStore::connection()`
+# would hand back a `Connection` from a different rusqlite and fail to type-check.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
+url = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

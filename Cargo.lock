@@ -1197,8 +1197,20 @@ dependencies = [
 name = "git-repo-migrator-desktop"
 version = "0.1.0"
 dependencies = [
+ "git-repo-migrator-application",
+ "git-repo-migrator-domain",
+ "git-repo-migrator-git-runner",
+ "git-repo-migrator-local-store",
+ "git-repo-migrator-platform-core",
+ "git-repo-migrator-platform-generic",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
+ "tempfile",
+ "url",
 ]
 
 [[package]]
