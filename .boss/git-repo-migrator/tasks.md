@@ -604,3 +604,22 @@ graph TD
 | 版本 | 日期 | 作者 | 变更内容 |
 |---|---|---|---|
 | 1.0 | 2026-08-26 | Scrum Master Agent | 初始任务拆解、写集、依赖、Evidence Waves 与 Contract Matrix |
+| 1.1 | 2026-08-28 | 实现记录 | 按执行规则 4 补记 Wave 5 实际写集与偏差（见附录 A） |
+
+## 附录 A：Wave 5 实际写集（执行规则 4 补记）
+
+T-023 至 T-029 的实现需要的文件多于任务表中列出的三文件上限。以下为实际写入清单，未涉及本 Wave 之外的 owner 文件。
+
+| 任务 | 计划外新增文件 | 原因 |
+|---|---|---|
+| T-023 | `apps/desktop/src-tauri/src/{dto,errors,ports,state,snapshot}.rs`、`src/{flow_tests,contract_tests}.rs`、`apps/desktop/src/state/{ipcTypes,ipcClient,planDraft,testBridge,testSetup}.ts` | 命令层需要快照 DTO、错误构造、可注入端口与 SQLite 读取层；契约测试需要 Rust→TS 漂移守卫与前端测试替身 |
+| T-024 | `apps/desktop/src/components/primitives.tsx`、`apps/desktop/src/router.test.tsx` | 状态徽章、抽屉、对话框等共享组件由 AppShell 与全部 feature 复用 |
+| T-025..029 | 各 feature 目录内文件与任务表一致 | — |
+
+其他偏差：
+
+1. `apps/desktop/src-tauri/Cargo.toml`（T-002 owner）新增依赖：application/domain/git-runner/local-store/platform-core/platform-generic、rusqlite（版本必须与 `crates/local-store` 一致）、serde、serde_json、sha2、url、tempfile(dev)，并启用 workspace lints。
+2. `apps/desktop/package.json` / `package-lock.json`（T-003 owner）新增 devDependencies：`jsdom`、`@testing-library/react`、`@testing-library/dom`；`vitest` 由 ^2 升级至 ^3 以匹配 Vite 6 的类型（用户已确认依赖变更）。
+3. `apps/desktop/vite.config.ts` 增加 vitest 配置块并改用 `vitest/config` 的 `defineConfig`。
+4. 删除 Wave 1 占位文件 `apps/desktop/src/App.tsx` 与 `apps/desktop/src/styles.css`，其职责由 `router.tsx`、`components/AppShell.tsx` 与 `styles/tokens.css` 取代。
+5. `apps/desktop/src/generated/ipc.ts`（T-021 owner）未修改；桌面壳新增的快照类型放在 `state/ipcTypes.ts`，由 `contract_tests.rs` 守卫漂移。

@@ -127,7 +127,7 @@
       ],
       "contractRows": ["CM-001", "CM-002", "CM-003", "CM-004", "CM-005", "CM-006", "CM-007", "CM-008", "CM-009", "CM-012"],
       "stopCondition": "renderer 可执行任意 shell/读取 secret、事件丢失无法从 SQLite 校正、危险操作只由 UI 控制、fidelity/冲突状态或路由与后端 schema 不一致、关键文本重叠/不可访问时停止。",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "wave-6-windows-release",
