@@ -14,5 +14,11 @@ export default defineConfig({
     include: ["src/**/*.test.{ts,tsx}"],
     setupFiles: ["./src/state/testSetup.ts"],
     restoreMocks: true,
+    // The capacity tests render hundreds of rows in jsdom. Under a fully
+    // parallel run on a loaded CI agent that can exceed the 5s default, which
+    // produces flakes rather than a real responsiveness signal — that budget is
+    // asserted against the real browser in `tests/e2e`.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 });

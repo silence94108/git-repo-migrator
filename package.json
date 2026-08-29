@@ -1,0 +1,14 @@
+{
+  "name": "git-repo-migrator-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Windows GUI end-to-end suite. The application itself lives in apps/desktop; this manifest exists so the specs under tests/e2e can resolve @playwright/test.",
+  "scripts": {
+    "e2e": "playwright test --config apps/desktop/playwright.config.ts",
+    "e2e:webview": "playwright test --config apps/desktop/playwright.config.ts --project=webview",
+    "e2e:desktop": "playwright test --config apps/desktop/playwright.config.ts --project=desktop"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0"
+  }
+}

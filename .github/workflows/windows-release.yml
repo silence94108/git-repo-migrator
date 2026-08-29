@@ -1,0 +1,140 @@
+name: windows-release
+
+# Produces a signed Windows installer for a tag. Everything this workflow needs
+# that is secret comes from the repository's CI secret store; nothing is read
+# from the working tree, an environment file or a build argument.
+#
+# The release is gated: `docs/release-checklist.md` items that cannot be checked
+# by a machine (Windows 10/11 hardware runs, Git/Git LFS distribution licensing,
+# update-signing key custody) must be recorded in the release issue before the
+# `release` environment approves this run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build, sign and publish
+    runs-on: windows-latest
+    timeout-minutes: 120
+    # A protected environment is what enforces the manual checklist review.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Verify the tag matches the product version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag || github.ref_name }}" -replace '^v',''
+          $conf = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($conf.version -ne $tag) {
+            Write-Error "tag $tag does not match tauri.conf.json version $($conf.version)"
+            exit 1
+          }
+
+      - name: Install
+        run: |
+          npm ci
+          npm ci --prefix apps/desktop
+
+      # The gates are re-run here rather than trusted from CI: a tag can point
+      # at a commit that never went through a pull request.
+      - name: Re-run the blocking gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          npm run typecheck --prefix apps/desktop
+          npm run test --prefix apps/desktop
+
+      # The companion is declared in tauri.bundle.conf.json rather than in the
+      # base config: `tauri-build` requires every declared resource to exist, and
+      # a plain `cargo build` or `cargo test` must not depend on a staged binary.
+      - name: Stage credential companion
+        shell: pwsh
+        run: |
+          cargo build --release -p git-repo-migrator-credential-store --bin git-repo-migrator-credential
+          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/binaries | Out-Null
+          Copy-Item target/release/git-repo-migrator-credential.exe `
+            apps/desktop/src-tauri/binaries/git-repo-migrator-credential.exe -Force
+
+      - name: Build signed bundle
+        working-directory: apps/desktop
+        env:
+          # Authenticode: the certificate never touches the working tree.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: npm run tauri build -- --config src-tauri/tauri.bundle.conf.json
+
+      - name: Fail if the bundle is unsigned
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem -Recurse -Path target/release/bundle `
+            -Include *.msi,*.exe -ErrorAction SilentlyContinue
+          if (-not $artifacts) { Write-Error "no installer was produced"; exit 1 }
+          foreach ($artifact in $artifacts) {
+            $signature = Get-AuthenticodeSignature $artifact.FullName
+            Write-Host "$($artifact.Name): $($signature.Status)"
+            if ($signature.Status -ne 'Valid') {
+              Write-Error "unsigned or invalid artifact: $($artifact.Name) ($($signature.Status))"
+              exit 1
+            }
+          }
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $out = "dist-release"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Get-ChildItem -Recurse -Path target/release/bundle `
+            -Include *.msi,*.exe,*.sig | ForEach-Object {
+              Copy-Item $_.FullName $out
+            }
+          Get-ChildItem $out | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content "$out/SHA256SUMS.txt"
+          Get-Content "$out/SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist-release
+          retention-days: 30
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/*
+          draft: true
+          # Draft, always: a human attaches the completed checklist and the
+          # Windows 10/11 hardware results before the release goes public.
+          generate_release_notes: true

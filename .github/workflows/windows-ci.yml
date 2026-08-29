@@ -1,0 +1,210 @@
+name: windows-ci
+
+# Every gate that decides whether a change is releasable runs here, on Windows,
+# because that is the only platform this product ships to. Nothing in this file
+# reads a signing secret; signing lives in windows-release.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed build must not be retried silently on a flaky network.
+  CARGO_NET_RETRY: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, tests)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and components, so the toolchain is
+      # part of the repository rather than of this workflow.
+      - name: Show pinned toolchain
+        run: |
+          rustup show
+          cargo --version
+          git --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The Git fixtures create real bare repositories, so a working git.exe is
+      # a prerequisite rather than an optional extra.
+      - name: Configure Git for fixtures
+        run: |
+          git config --global user.name "CI Fixture"
+          git config --global user.email "ci@example.test"
+          git config --global init.defaultBranch main
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+  renderer:
+    name: Renderer (typecheck, unit tests, build)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      # `npm ci`, never `npm install`: the lockfile is the input, not a hint.
+      - name: Install
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: apps/desktop
+
+      - name: Unit tests
+        run: npm run test
+        working-directory: apps/desktop
+
+      - name: Production build
+        run: npm run build
+        working-directory: apps/desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renderer-dist
+          path: apps/desktop/dist
+          retention-days: 7
+
+  e2e-webview:
+    name: E2E (webview)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: renderer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop/package-lock.json
+
+      - name: Install E2E runner
+        run: npm ci
+
+      - name: Install renderer
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+
+      # The security spec asserts the E2E bridge seam is absent from the
+      # production bundle, so that bundle has to exist before the suite runs.
+      - name: Production build
+        run: npm run build
+        working-directory: apps/desktop
+
+      - name: Run E2E
+        run: npm run e2e:webview
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            apps/desktop/playwright-report
+            apps/desktop/test-results
+          retention-days: 7
+
+  application:
+    name: Packaged application (build + desktop E2E)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    needs: [rust, renderer]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install
+        run: |
+          npm ci
+          npm ci --prefix apps/desktop
+
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+
+      # The credential companion is a console binary shipped next to the app.
+      # Tauri expects an externalBin named with the target triple.
+      - name: Stage credential companion sidecar
+        shell: pwsh
+        run: |
+          cargo build --release -p git-repo-migrator-credential-store --bin git-repo-migrator-credential
+          $triple = (rustc -vV | Select-String '^host:').ToString().Split(' ')[1]
+          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/binaries | Out-Null
+          Copy-Item target/release/git-repo-migrator-credential.exe `
+            "apps/desktop/src-tauri/binaries/git-repo-migrator-credential-$triple.exe" -Force
+
+      - name: Build application
+        run: npm run tauri build -- --no-bundle
+        working-directory: apps/desktop
+
+      - name: Desktop E2E
+        env:
+          E2E_TAURI_BINARY: apps\desktop\src-tauri\target\release\git-repo-migrator.exe
+        run: npm run e2e:desktop
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-e2e-report
+          path: |
+            apps/desktop/playwright-report
+            apps/desktop/test-results
+          retention-days: 7
+
+  gate:
+    name: Release gate
+    runs-on: windows-latest
+    needs: [rust, renderer, e2e-webview, application]
+    if: always()
+    steps:
+      # A skipped or failed upstream job must not read as a pass; the release
+      # workflow refuses to sign anything this gate did not clear.
+      - name: Require every gate to have passed
+        shell: pwsh
+        run: |
+          $results = '${{ needs.rust.result }}','${{ needs.renderer.result }}','${{ needs.e2e-webview.result }}','${{ needs.application.result }}'
+          $failed = $results | Where-Object { $_ -ne 'success' }
+          if ($failed) {
+            Write-Error "release gate blocked: $($results -join ', ')"
+            exit 1
+          }
+          Write-Host "all gates passed"
