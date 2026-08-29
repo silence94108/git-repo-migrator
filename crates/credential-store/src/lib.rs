@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod prompt;
+
 #[derive(Clone)]
 pub struct CredentialStore {
     entries: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
@@ -47,7 +49,7 @@ impl CredentialStore {
         if service.trim().is_empty() || secret.is_empty() {
             return Err(PlatformError::validation("凭据服务名和 secret 不能为空"));
         }
-        let id = format!("credential/windows/{}", stable_id(service));
+        let id = format!("credential/windows/{}", stable_id(service.trim()));
         match self.backend {
             Backend::Memory => {
                 self.entries
@@ -139,7 +141,7 @@ fn keyring_error(_: keyring::Error) -> PlatformError {
     }
 }
 
-fn stable_id(value: &str) -> String {
+pub(crate) fn stable_id(value: &str) -> String {
     let mut hash = 2166136261u32;
     for byte in value.as_bytes() {
         hash ^= u32::from(*byte);

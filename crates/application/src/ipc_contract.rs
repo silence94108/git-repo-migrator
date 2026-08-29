@@ -15,6 +15,17 @@ pub struct RepositoryDiscoverInput {
     pub connection_id: String,
     pub query: DiscoveryQuery,
 }
+/// Asks the backend to open the native credential-entry window.
+///
+/// The payload is a *name*, never a secret: the token is typed into a separate
+/// console process and written straight to Windows Credential Manager, so it
+/// never crosses this boundary. `deny_unknown_fields` makes a renderer that
+/// tries to smuggle one fail loudly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionAuthorizeInput {
+    pub name: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanPreviewInput {
@@ -100,6 +111,23 @@ mod tests {
     fn command_inputs_reject_unknown_fields() {
         let value = r#"{"endpoint":"https://github.com","platform_hint":"github","credential_ref":null,"token":"secret"}"#;
         assert!(serde_json::from_str::<ConnectionTestInput>(value).is_err());
+    }
+
+    /// The authorize command is the closest thing to a credential command in the
+    /// surface, so it is the one most worth pinning: only a name gets through.
+    #[test]
+    fn authorize_accepts_a_name_and_nothing_else() {
+        assert!(serde_json::from_str::<ConnectionAuthorizeInput>(r#"{"name":"source"}"#).is_ok());
+        for value in [
+            r#"{"name":"source","token":"ghp-secret"}"#,
+            r#"{"name":"source","secret":"x"}"#,
+            r#"{"name":"source","password":"x"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ConnectionAuthorizeInput>(value).is_err(),
+                "{value} must be rejected"
+            );
+        }
     }
     #[test]
     fn events_have_no_secret_or_response_fields() {

@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod executor;
 pub mod ipc_contract;
 pub mod orchestrator;
 pub mod planning;
@@ -8,6 +9,10 @@ pub mod report;
 pub mod verification;
 
 pub use archive::{ArchiveAttachment, ArchiveDocument, ArchiveItem};
+pub use executor::{
+    ExecutionAction, ExecutionStage, ModuleGateway, ModuleReport, StageExecutor, StageRecorder,
+    TargetGateway, TaskAssignment, TaskExecution,
+};
 pub use ipc_contract::{typescript_contract, IpcError, MigrationEvent};
 pub use orchestrator::{BatchControl, Orchestrator, QueueTask, RetryDecision};
 pub use planning::{build_preview, Candidate, PlanPreview, SelectionSet, TargetState};

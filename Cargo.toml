@@ -6,7 +6,7 @@ publish = false
 
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/local-store", "crates/git-runner", "crates/workspace", "crates/platform-core", "crates/platform-generic", "crates/application", "crates/credential-store", "crates/platform-github", "crates/platform-gitlab", "crates/platform-gitea", "crates/platform-gitee", "apps/desktop/src-tauri"]
+members = ["crates/domain", "crates/local-store", "crates/git-runner", "crates/workspace", "crates/platform-core", "crates/platform-generic", "crates/application", "crates/credential-store", "crates/http-transport", "crates/platform-github", "crates/platform-gitlab", "crates/platform-gitea", "crates/platform-gitee", "apps/desktop/src-tauri"]
 
 [workspace.package]
 edition = "2021"
@@ -24,13 +24,18 @@ async-trait = "0.1"
 futures = "0.3"
 git-repo-migrator-application = { path = "crates/application" }
 git-repo-migrator-domain = { path = "crates/domain" }
+git-repo-migrator-git-runner = { path = "crates/git-runner" }
 git-repo-migrator-platform-core = { path = "crates/platform-core" }
 git-repo-migrator-platform-github = { path = "crates/platform-github" }
 git-repo-migrator-platform-gitlab = { path = "crates/platform-gitlab" }
 git-repo-migrator-platform-gitea = { path = "crates/platform-gitea" }
 git-repo-migrator-platform-gitee = { path = "crates/platform-gitee" }
+git-repo-migrator-workspace = { path = "crates/workspace" }
 serde_json = "1"
 sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[test]]
 name = "github_adapter"
@@ -51,3 +56,7 @@ path = "tests/contract/ipc_schema_contract.rs"
 [[test]]
 name = "platform_fidelity"
 path = "tests/integration/platform_fidelity.rs"
+
+[[test]]
+name = "generic_migration_flow"
+path = "tests/integration/generic_migration_flow.rs"

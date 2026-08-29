@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "git-repo-migrator-credential"
+path = "src/bin/credential_entry.rs"
+
 [dependencies]
 git-repo-migrator-platform-core = { path = "../platform-core" }
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+rpassword = "7"
 
 [lints]
 workspace = true
