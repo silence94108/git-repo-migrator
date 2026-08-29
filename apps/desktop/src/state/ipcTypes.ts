@@ -9,6 +9,8 @@
  */
 
 export type {
+  ConnectionAuthorizeInput,
+  ConnectionAuthorizeOutcome,
   ConnectionTestInput,
   DiscoveryQuery,
   ErrorCategory,

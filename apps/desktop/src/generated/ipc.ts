@@ -9,6 +9,8 @@ export type RepositoryVisibility = "public" | "internal" | "private" | "unknown"
 export interface DiscoveryQuery { scope: RepositoryScope; search?: string | null; visibility?: RepositoryVisibility | null; include_archived: boolean; cursor?: string | null; page_size: number; }
 export interface ConnectionTestInput { endpoint: string; platform_hint?: PlatformKind | null; credential_ref?: string | null; }
 export interface RepositoryDiscoverInput { connection_id: string; query: DiscoveryQuery; }
+export interface ConnectionAuthorizeInput { name: string; }
+export interface ConnectionAuthorizeOutcome { credential_ref: string; instructions: string; }
 export interface PlanPreviewInput { selected_repository_ids: string[]; conflict_policy: string; modules: string[]; }
 export interface BatchStartInput { plan_id: string; concurrency: number; workspace_policy: string; }
 export interface TaskRetryInput { batch_id: string; task_ids: string[]; }

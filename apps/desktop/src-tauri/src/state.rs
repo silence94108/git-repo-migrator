@@ -13,8 +13,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use git_repo_migrator_application::executor::{ExecutionAction, TaskAssignment};
 use git_repo_migrator_application::ipc_contract::{
-    BatchStartInput, ConnectionTestInput, ReportExportInput, TaskRetryInput,
+    BatchStartInput, ConnectionAuthorizeInput, ConnectionTestInput, ReportExportInput,
+    TaskRetryInput,
 };
 use git_repo_migrator_application::planning::{
     build_preview, Candidate, SelectionSet, TargetState,
@@ -41,9 +43,11 @@ use crate::dto::{
     RepositoryPage, RepositorySnapshot, TargetProbeInput, SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::errors;
+use git_repo_migrator_credential_store::prompt::{reference_for, validate_name};
+
 use crate::ports::{
-    Clock, DiscoveryGateway, ExportSink, FileExportSink, SystemClock, TargetProbe,
-    TransportNotWired,
+    BatchLauncher, Clock, CompanionProcessLauncher, DiscoveryGateway, ExportSink, FileExportSink,
+    IdentityEntryLauncher, SystemClock, TargetProbe, TransportNotWired,
 };
 use crate::snapshot::{self, CandidateDetails, ConnectionDetails, PlanSelection, VerifySummary};
 
@@ -88,6 +92,14 @@ pub struct RetryRejection {
     pub reason: String,
 }
 
+/// Result of opening the credential-entry window. Carries a reference and an
+/// instruction, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorizeOutcome {
+    pub credential_ref: String,
+    pub instructions: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExportOutcome {
     pub path: String,
@@ -124,6 +136,11 @@ pub struct AppState {
     probe: Option<Arc<dyn TargetProbe>>,
     discovery: Arc<dyn DiscoveryGateway>,
     export: Arc<dyn ExportSink>,
+    identity_entry: Arc<dyn IdentityEntryLauncher>,
+    /// Installed after construction, because the worker pool needs a handle to
+    /// the state it reports into. Absent in tests, which drive the stage
+    /// recording API directly.
+    launcher: Mutex<Option<Arc<dyn BatchLauncher>>>,
 }
 
 impl AppState {
@@ -149,6 +166,8 @@ impl AppState {
             probe: None,
             discovery: Arc::new(TransportNotWired),
             export: Arc::new(FileExportSink),
+            identity_entry: Arc::new(CompanionProcessLauncher),
+            launcher: Mutex::new(None),
         }
     }
 
@@ -170,6 +189,49 @@ impl AppState {
     pub fn with_export_sink(mut self, export: Arc<dyn ExportSink>) -> Self {
         self.export = export;
         self
+    }
+
+    /// Installs the worker pool. Takes `&self` because the pool needs an
+    /// `Arc<AppState>`, which only exists once the state is constructed.
+    pub fn install_launcher(&self, launcher: Arc<dyn BatchLauncher>) {
+        match self.launcher.lock() {
+            Ok(mut slot) => *slot = Some(launcher),
+            Err(poisoned) => *poisoned.into_inner() = Some(launcher),
+        }
+    }
+
+    pub fn with_identity_entry(mut self, entry: Arc<dyn IdentityEntryLauncher>) -> Self {
+        self.identity_entry = entry;
+        self
+    }
+
+    /// Opens the native credential-entry window and returns the reference the
+    /// operator will get, so the connection form can be prefilled.
+    ///
+    /// No secret crosses this call in either direction.
+    pub fn authorize_connection(
+        &self,
+        input: &ConnectionAuthorizeInput,
+    ) -> Result<AuthorizeOutcome, IpcError> {
+        let name = validate_name(&input.name)
+            .map_err(|error| errors::from_platform("connection", &error))?;
+        let reference =
+            reference_for(name).map_err(|error| errors::from_platform("connection", &error))?;
+        self.identity_entry.launch(name)?;
+        Ok(AuthorizeOutcome {
+            credential_ref: reference.as_str().to_owned(),
+            instructions: format!(
+                "已打开凭据录入窗口。请在该窗口中粘贴令牌两次；界面不会收到令牌本身。完成后凭据引用为 {}",
+                reference.as_str()
+            ),
+        })
+    }
+
+    fn launcher(&self) -> Option<Arc<dyn BatchLauncher>> {
+        match self.launcher.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -282,9 +344,12 @@ impl AppState {
             .find(|connection| connection.id == connection_id)
             .ok_or_else(|| errors::not_found("discovery", "源连接"))?;
 
-        let candidates =
-            self.discovery
-                .discover(&connection.endpoint, connection.platform, query)?;
+        let candidates = self.discovery.discover(
+            &connection.endpoint,
+            connection.platform,
+            connection.credential_ref.as_deref(),
+            query,
+        )?;
 
         let mut inner = self.lock();
         let mut warnings = Vec::new();
@@ -959,9 +1024,16 @@ impl AppState {
         inner.concurrency.insert(batch_id.clone(), concurrency);
         inner.revision += 1;
 
-        snapshot::read_batch(&inner.store, &batch_id, concurrency)
+        let snapshot = snapshot::read_batch(&inner.store, &batch_id, concurrency)
             .map_err(|error| errors::store("queue", &error))?
-            .ok_or_else(|| errors::not_found("queue", "刚创建的批次"))
+            .ok_or_else(|| errors::not_found("queue", "刚创建的批次"))?;
+        // The lock is released before the pool starts, otherwise the first
+        // worker would block on the very command that created its batch.
+        drop(inner);
+        if let Some(launcher) = self.launcher() {
+            launcher.launch(&batch_id, concurrency);
+        }
+        Ok(snapshot)
     }
 
     pub fn set_control(
@@ -1021,9 +1093,23 @@ impl AppState {
         inner.revision += 1;
 
         let concurrency = inner.concurrency.get(&input.batch_id).copied().unwrap_or(1);
-        snapshot::read_batch(&inner.store, &input.batch_id, concurrency)
+        let snapshot = snapshot::read_batch(&inner.store, &input.batch_id, concurrency)
             .map_err(|error| errors::store("queue", &error))?
-            .ok_or_else(|| errors::not_found("queue", "批次"))
+            .ok_or_else(|| errors::not_found("queue", "批次"))?;
+        drop(inner);
+
+        if let Some(launcher) = self.launcher() {
+            match next {
+                // Cancelling only signals; in-flight stages stop at their next
+                // checkpoint and finished repositories are never rolled back.
+                BatchControl::Cancelled => launcher.cancel(&input.batch_id),
+                // Workers exit when a batch pauses, so resuming has to start
+                // them again. `launch` is idempotent.
+                BatchControl::Running => launcher.launch(&input.batch_id, concurrency),
+                BatchControl::Paused | BatchControl::Completed => {}
+            }
+        }
+        Ok(snapshot)
     }
 
     pub fn retry_tasks(&self, input: &TaskRetryInput) -> Result<RetryOutcome, IpcError> {
@@ -1116,6 +1202,15 @@ impl AppState {
         let batch = snapshot::read_batch(&inner.store, &input.batch_id, concurrency)
             .map_err(|error| errors::store("queue", &error))?
             .ok_or_else(|| errors::not_found("queue", "批次"))?;
+        drop(inner);
+
+        // A retry that reopened the batch needs workers again; a paused batch
+        // stays paused, so the pool is only started for a running one.
+        if !retried.is_empty() && batch.control == BatchControl::Running {
+            if let Some(launcher) = self.launcher() {
+                launcher.launch(&input.batch_id, concurrency);
+            }
+        }
         Ok(RetryOutcome {
             retried,
             rejected,
@@ -1254,6 +1349,145 @@ impl AppState {
     //
     // These are not commands. Only the backend executor may assert that work
     // happened, so the renderer cannot fabricate progress or a success.
+
+    /// Current batch control, as the worker pool sees it.
+    pub fn batch_control(&self, batch_id: &str) -> BatchControl {
+        let inner = self.lock();
+        inner
+            .store
+            .connection()
+            .query_row(
+                "SELECT status FROM batch WHERE id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .map(|status| snapshot::parse_control(&status))
+            // An unreadable batch must not look runnable.
+            .unwrap_or(BatchControl::Cancelled)
+    }
+
+    /// Takes the next runnable repository for `owner`, claiming its lease in the
+    /// same call so two workers can never pick up the same task.
+    ///
+    /// Returns `None` when the batch is not running or has no runnable rows
+    /// left; the worker then exits instead of spinning.
+    pub fn claim_next_task(
+        &self,
+        batch_id: &str,
+        owner: &str,
+    ) -> Result<Option<TaskAssignment>, IpcError> {
+        let inner = self.lock();
+        let now = self.clock.now_ms();
+
+        let status = inner
+            .store
+            .connection()
+            .query_row(
+                "SELECT status FROM batch WHERE id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| errors::store("queue", &error.into()))?
+            .ok_or_else(|| errors::not_found("queue", "批次"))?;
+        if snapshot::parse_control(&status) != BatchControl::Running {
+            return Ok(None);
+        }
+
+        let (module_json, policy_json) = inner
+            .store
+            .connection()
+            .query_row(
+                "SELECT p.module_json, p.policy_json
+                 FROM batch b JOIN plan p ON p.id = b.plan_id
+                 WHERE b.id = ?1",
+                params![batch_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| errors::store("queue", &error.into()))?
+            .ok_or_else(|| errors::not_found("queue", "批次的冻结计划"))?;
+        let modules: ModuleSelection = serde_json::from_str(&module_json)
+            .map_err(|_| errors::validation("queue", "模块选择无法解析", "请重新预检"))?;
+        let (policy, ref_policy): (ConflictPolicy, RefPolicy) = serde_json::from_str(&policy_json)
+            .map_err(|_| errors::validation("queue", "策略数据无法解析", "请重新预检"))?;
+
+        let candidate = inner
+            .store
+            .connection()
+            .query_row(
+                "SELECT t.id, t.target_url, t.action, t.attempt, c.source_url, c.name,
+                        c.metadata_json
+                 FROM repository_task t
+                 JOIN repository_candidate c ON c.id = t.candidate_id
+                 WHERE t.batch_id = ?1
+                   AND t.status = 'planned'
+                   AND (t.lease_owner IS NULL OR t.lease_expires_at_ms <= ?2)
+                 ORDER BY t.id
+                 LIMIT 1",
+                params![batch_id, now],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| errors::store("queue", &error.into()))?;
+        let Some((task_id, target_url, action, attempt, source_url, name, metadata)) = candidate
+        else {
+            return Ok(None);
+        };
+
+        if !inner
+            .store
+            .leases()
+            .acquire(&task_id, owner, now, LEASE_TTL_MS)
+            .map_err(|error| errors::store("queue", &error))?
+        {
+            // Another worker won the race; the caller asks again.
+            return Ok(None);
+        }
+
+        // A `git` checkpoint from an earlier attempt is what distinguishes "we
+        // already pushed to this target" from "someone else filled it in".
+        let resumed_attempt = attempt > 0
+            || inner
+                .store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM checkpoint WHERE task_id = ?1 AND stage = 'git'",
+                    params![task_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| errors::store("queue", &error.into()))?
+                .unwrap_or(0)
+                > 0;
+
+        let details: CandidateDetails = serde_json::from_str(&metadata).unwrap_or_default();
+        Ok(Some(TaskAssignment {
+            batch_id: batch_id.to_owned(),
+            task_id,
+            source_url,
+            target_url,
+            target_name: details.target_name.unwrap_or(name),
+            action: ExecutionAction::parse(&action).unwrap_or(ExecutionAction::Blocked),
+            modules,
+            ref_policy,
+            allow_overwrite: policy.allow_overwrite,
+            resumed_attempt,
+        }))
+    }
 
     pub fn begin_stage(
         &self,

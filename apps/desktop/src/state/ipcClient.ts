@@ -14,6 +14,7 @@ export const COMMANDS = [
   "migration_snapshot",
   "connection_test",
   "connection_save",
+  "connection_authorize",
   "repository_discover",
   "repository_import",
   "repository_probe_target",

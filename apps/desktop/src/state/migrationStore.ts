@@ -16,6 +16,7 @@ import type { PlanDraft } from "./planDraft";
 import { SUPPORTED_SNAPSHOT_SCHEMA_VERSION } from "./ipcTypes";
 import type {
   BatchSnapshot,
+  ConnectionAuthorizeOutcome,
   ConnectionSaveInput,
   ConnectionSnapshot,
   ConnectionTestInput,
@@ -178,6 +179,16 @@ export class MigrationStore {
   saveConnection = (input: ConnectionSaveInput): Promise<IpcResult<ConnectionSnapshot>> =>
     this.mutate<ConnectionSnapshot>("connection_save", "connection", { input });
 
+  /**
+   * Opens the native credential-entry window. The renderer sends a name and
+   * receives a reference; the token itself is typed into a separate console
+   * process and never reaches this code.
+   */
+  authorizeConnection = (name: string): Promise<IpcResult<ConnectionAuthorizeOutcome>> =>
+    call<ConnectionAuthorizeOutcome>(this.bridge, "connection_authorize", "connection", {
+      input: { name },
+    });
+
   discoverRepositories = (
     connectionId: string,
     query: DiscoveryQuery,
@@ -247,8 +258,26 @@ export class MigrationStore {
 
 let sharedStore: MigrationStore | undefined;
 
+/**
+ * Browser-driven E2E seam.
+ *
+ * The Playwright `webview` project runs the real bundle in a real browser, where
+ * there is no Tauri runtime to talk to. It installs a bridge on `window` before
+ * the app boots and the store picks it up here.
+ *
+ * This is compiled out of a production build: `import.meta.env.MODE` is
+ * `"production"` for `npm run build`, so the branch becomes `if (false)` and the
+ * bundler drops it. `no_e2e_bridge_seam_in_the_production_bundle` in
+ * `tests/e2e/security-boundary.spec.ts` asserts that it really is gone.
+ */
+function injectedBridge(): MigrationBridge | undefined {
+  if (import.meta.env.MODE === "production") return undefined;
+  if (typeof window === "undefined") return undefined;
+  return (window as { __migrationBridge?: MigrationBridge }).__migrationBridge;
+}
+
 export function getMigrationStore(): MigrationStore {
-  sharedStore ??= new MigrationStore(createTauriBridge());
+  sharedStore ??= new MigrationStore(injectedBridge() ?? createTauriBridge());
   return sharedStore;
 }
 

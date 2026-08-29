@@ -568,6 +568,197 @@ fn workspace_policy_and_concurrency_are_validated_and_clamped() {
     assert_eq!(batch.concurrency, 8);
 }
 
+/// Records what the GUI hands the native entry process. The point of the test
+/// is what is *absent*: no secret ever reaches this port.
+#[derive(Default)]
+struct RecordingEntry {
+    launched: Mutex<Vec<String>>,
+    fail: Mutex<bool>,
+}
+
+impl RecordingEntry {
+    fn launched(&self) -> Vec<String> {
+        self.launched.lock().expect("entry lock").clone()
+    }
+}
+
+impl crate::ports::IdentityEntryLauncher for RecordingEntry {
+    fn launch(&self, name: &str) -> Result<(), IpcError> {
+        if *self.fail.lock().expect("entry lock") {
+            return Err(errors::error(
+                "credential.companion_missing",
+                ErrorCategory::Validation,
+                false,
+                "connection",
+                "找不到凭据录入程序",
+                "请重新安装应用",
+            ));
+        }
+        self.launched
+            .lock()
+            .expect("entry lock")
+            .push(name.to_owned());
+        Ok(())
+    }
+}
+
+/// The credential boundary in one test: a name goes in, a reference comes out,
+/// and the entry process — not the GUI — is what reads the token.
+#[test]
+fn authorizing_a_connection_moves_a_name_in_and_a_reference_out() {
+    let entry = Arc::new(RecordingEntry::default());
+    let state = AppState::in_memory()
+        .expect("in-memory store")
+        .with_clock(Arc::new(StepClock::new()))
+        .with_identity_entry(entry.clone());
+
+    let outcome = state
+        .authorize_connection(
+            &git_repo_migrator_application::ipc_contract::ConnectionAuthorizeInput {
+                name: "source".to_owned(),
+            },
+        )
+        .expect("entry launched");
+
+    assert_eq!(entry.launched(), ["source"]);
+    assert!(outcome.credential_ref.starts_with("credential/windows/"));
+    let serialised = serde_json::to_string(&outcome).expect("serialised");
+    for forbidden in ["token", "secret", "password", "ghp_"] {
+        assert!(
+            !serialised.contains(forbidden),
+            "{forbidden} leaked into the authorize outcome"
+        );
+    }
+}
+
+#[test]
+fn a_credential_name_that_could_be_read_as_a_flag_never_reaches_the_entry_process() {
+    let entry = Arc::new(RecordingEntry::default());
+    let state = AppState::in_memory()
+        .expect("in-memory store")
+        .with_identity_entry(entry.clone());
+
+    for name in ["", "--help", "../../etc", "a b", "name;calc.exe"] {
+        let error = state
+            .authorize_connection(
+                &git_repo_migrator_application::ipc_contract::ConnectionAuthorizeInput {
+                    name: name.to_owned(),
+                },
+            )
+            .expect_err("an unsafe name must be refused");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+    assert!(
+        entry.launched().is_empty(),
+        "no process may be started for a rejected name"
+    );
+}
+
+#[test]
+fn a_missing_entry_program_is_reported_with_a_next_step() {
+    let entry = Arc::new(RecordingEntry::default());
+    *entry.fail.lock().expect("entry lock") = true;
+    let state = AppState::in_memory()
+        .expect("in-memory store")
+        .with_identity_entry(entry);
+
+    let error = state
+        .authorize_connection(
+            &git_repo_migrator_application::ipc_contract::ConnectionAuthorizeInput {
+                name: "source".to_owned(),
+            },
+        )
+        .expect_err("a missing companion must surface");
+    assert_eq!(error.code, "credential.companion_missing");
+    assert!(!error.action.is_empty());
+}
+
+#[derive(Default)]
+struct RecordingLauncher {
+    calls: Mutex<Vec<(String, String, u16)>>,
+}
+
+impl RecordingLauncher {
+    fn calls(&self) -> Vec<(String, String, u16)> {
+        self.calls.lock().expect("launcher lock").clone()
+    }
+}
+
+impl crate::ports::BatchLauncher for RecordingLauncher {
+    fn launch(&self, batch_id: &str, concurrency: u16) {
+        self.calls.lock().expect("launcher lock").push((
+            "launch".to_owned(),
+            batch_id.to_owned(),
+            concurrency,
+        ));
+    }
+    fn cancel(&self, batch_id: &str) {
+        self.calls.lock().expect("launcher lock").push((
+            "cancel".to_owned(),
+            batch_id.to_owned(),
+            0,
+        ));
+    }
+}
+
+/// The queue commands must be what starts and stops the worker pool. Without
+/// this link a started batch would sit at `planned` forever, which is exactly
+/// the gap Wave 5 left open.
+#[test]
+fn the_queue_commands_drive_the_worker_pool() {
+    let Harness { state, .. } = harness(TargetState::Empty);
+    let launcher = Arc::new(RecordingLauncher::default());
+    state.install_launcher(launcher.clone());
+
+    let batch = started_batch(&state, 2);
+    let id = batch.batch_id.clone();
+    assert_eq!(
+        launcher.calls(),
+        vec![("launch".to_owned(), id.clone(), 2)],
+        "starting a batch must start its workers"
+    );
+
+    state
+        .set_control(
+            &BatchIdInput {
+                batch_id: id.clone(),
+            },
+            BatchControl::Paused,
+        )
+        .expect("paused");
+    assert_eq!(
+        launcher.calls().len(),
+        1,
+        "pausing lets the workers drain; it must not start more"
+    );
+
+    state
+        .set_control(
+            &BatchIdInput {
+                batch_id: id.clone(),
+            },
+            BatchControl::Running,
+        )
+        .expect("resumed");
+    state
+        .set_control(
+            &BatchIdInput {
+                batch_id: id.clone(),
+            },
+            BatchControl::Cancelled,
+        )
+        .expect("cancelled");
+
+    assert_eq!(
+        launcher.calls(),
+        vec![
+            ("launch".to_owned(), id.clone(), 2),
+            ("launch".to_owned(), id.clone(), 2),
+            ("cancel".to_owned(), id, 0),
+        ]
+    );
+}
+
 #[test]
 fn a_paused_batch_reports_paused_and_cancel_keeps_finished_work() {
     let Harness { state, .. } = harness(TargetState::Empty);

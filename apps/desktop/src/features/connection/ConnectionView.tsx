@@ -22,6 +22,7 @@ import type { MigrationState, MigrationStore } from "../../state/migrationStore"
 import { connectionFor } from "../../state/migrationStore";
 import type {
   CapabilitySummary,
+  ConnectionAuthorizeOutcome,
   ConnectionRole,
   ConnectionSnapshot,
   IpcError,
@@ -39,7 +40,7 @@ import {
 } from "./connectionModel";
 import type { AuthMethod, ConnectionForm } from "./connectionModel";
 
-type PanelStatus = "idle" | "testing" | "saving" | "tested" | "saved";
+type PanelStatus = "idle" | "testing" | "saving" | "authorizing" | "tested" | "saved";
 
 function CapabilityMatrix({ capabilities }: { capabilities: CapabilitySummary[] }) {
   if (capabilities.length === 0) return null;
@@ -91,11 +92,13 @@ function ConnectionPanel({
   saved,
   onTest,
   onSave,
+  onAuthorizeRole,
 }: {
   role: ConnectionRole;
   saved: ConnectionSnapshot | null;
   onTest: (form: ConnectionForm) => Promise<CapabilitySummary[] | IpcError>;
   onSave: (form: ConnectionForm) => Promise<ConnectionSnapshot | IpcError>;
+  onAuthorizeRole: (name: ConnectionRole) => Promise<ConnectionAuthorizeOutcome | IpcError>;
 }) {
   const isSource = role === "source";
   const [form, setForm] = useState<ConnectionForm>(() => ({
@@ -108,10 +111,30 @@ function ConnectionPanel({
   const [touched, setTouched] = useState(false);
   const [error, setError] = useState<IpcError | null>(null);
   const [probed, setProbed] = useState<CapabilitySummary[]>(saved?.capabilities ?? []);
+  const [authorization, setAuthorization] = useState<string | null>(null);
+
+  /**
+   * Opens the native entry window and prefills the reference it will produce.
+   * Nothing about the token itself travels through this handler.
+   */
+  const onAuthorize = async (which: ConnectionRole) => {
+    setStatus("authorizing");
+    setError(null);
+    const outcome = await onAuthorizeRole(which);
+    if ("credential_ref" in outcome) {
+      setForm((current) => ({ ...current, credentialRef: outcome.credential_ref }));
+      setAuthorization(outcome.instructions);
+      setStatus("idle");
+      return;
+    }
+    setError(outcome);
+    setAuthorization(null);
+    setStatus("idle");
+  };
 
   const errors = validateForm(form);
   const showErrors = touched;
-  const busy = status === "testing" || status === "saving";
+  const busy = status === "testing" || status === "saving" || status === "authorizing";
 
   const patch = (next: Partial<ConnectionForm>) => {
     setForm((current) => ({ ...current, ...next }));
@@ -218,7 +241,7 @@ function ConnectionPanel({
 
       <Field
         label="凭据引用（Windows 凭据管理器名称）"
-        hint="界面不接收令牌。请先在 Windows 凭据管理器中保存令牌，再在此填写它的名称。"
+        hint="界面不接收令牌。点击「录入令牌」会打开本机凭据录入窗口；令牌只写入 Windows 凭据管理器。"
         error={showErrors ? errors.credentialRef : undefined}
       >
         {({ inputId, describedBy }) => (
@@ -236,6 +259,20 @@ function ConnectionPanel({
           />
         )}
       </Field>
+
+      <div className="button-row">
+        <button
+          type="button"
+          className="button button-secondary"
+          disabled={busy}
+          onClick={() => void onAuthorize(role)}
+        >
+          {status === "authorizing" ? <Spinner label="正在打开录入窗口" /> : "录入令牌"}
+        </button>
+      </div>
+      {authorization ? (
+        <Alert tone="info" title="已打开本机凭据录入窗口" action={authorization} />
+      ) : null}
 
       <label className="checkbox-row">
         <input
@@ -357,6 +394,11 @@ export function ConnectionView({
     return result.ok ? result.value : result.error;
   };
 
+  const authorize = async (name: ConnectionRole) => {
+    const result = await store.authorizeConnection(name);
+    return result.ok ? result.value : result.error;
+  };
+
   return (
     <>
       <Alert
@@ -373,6 +415,7 @@ export function ConnectionView({
           saved={source}
           onTest={(form) => test("source", form)}
           onSave={(form) => save("source", form)}
+          onAuthorizeRole={authorize}
         />
         <ConnectionPanel
           key={panelKey("target", target)}
@@ -380,6 +423,7 @@ export function ConnectionView({
           saved={target}
           onTest={(form) => test("target", form)}
           onSave={(form) => save("target", form)}
+          onAuthorizeRole={authorize}
         />
       </div>
       {source && target ? (

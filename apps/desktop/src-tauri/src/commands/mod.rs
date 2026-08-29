@@ -7,10 +7,12 @@
 //! exercise.
 
 use git_repo_migrator_application::ipc_contract::{
-    BatchStartInput, ConnectionTestInput, ReportExportInput, RepositoryDiscoverInput,
-    TaskRetryInput,
+    BatchStartInput, ConnectionAuthorizeInput, ConnectionTestInput, ReportExportInput,
+    RepositoryDiscoverInput, TaskRetryInput,
 };
 use git_repo_migrator_application::{BatchControl, IpcError};
+use std::sync::Arc;
+
 use tauri::State;
 
 use crate::dto::{
@@ -19,14 +21,15 @@ use crate::dto::{
     ReportSnapshot, RepositoryImportInput, RepositoryImportReport, RepositoryMappingInput,
     RepositoryPage, RepositorySnapshot, TargetProbeInput,
 };
-use crate::state::{AppState, ExportOutcome, RetryOutcome};
+use crate::state::{AppState, AuthorizeOutcome, ExportOutcome, RetryOutcome};
 
 /// Names registered with `tauri::generate_handler!`. Kept as data so a test can
 /// assert the surface never grows a dangerous capability by accident.
-pub const COMMAND_WHITELIST: [&str; 16] = [
+pub const COMMAND_WHITELIST: [&str; 17] = [
     "migration_snapshot",
     "connection_test",
     "connection_save",
+    "connection_authorize",
     "repository_discover",
     "repository_import",
     "repository_probe_target",
@@ -45,13 +48,13 @@ pub const COMMAND_WHITELIST: [&str; 16] = [
 /// The authoritative renderer state. Called on mount, on window focus and
 /// whenever an event envelope reports a revision ahead of the last snapshot.
 #[tauri::command]
-pub fn migration_snapshot(state: State<'_, AppState>) -> Result<MigrationSnapshot, IpcError> {
+pub fn migration_snapshot(state: State<'_, Arc<AppState>>) -> Result<MigrationSnapshot, IpcError> {
     state.snapshot()
 }
 
 #[tauri::command]
 pub fn connection_test(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: ConnectionTestInput,
 ) -> Result<Vec<CapabilitySummary>, IpcError> {
     state.test_connection(&input)
@@ -59,15 +62,29 @@ pub fn connection_test(
 
 #[tauri::command]
 pub fn connection_save(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: ConnectionSaveInput,
 ) -> Result<ConnectionSnapshot, IpcError> {
     state.save_connection(&input)
 }
 
+/// Opens the native credential-entry window.
+///
+/// This is the closest the command surface comes to a credential capability, and
+/// it deliberately stops short of one: the input is a name, the output is a
+/// reference, and the token is read by a separate console process that the
+/// renderer cannot talk to.
+#[tauri::command]
+pub fn connection_authorize(
+    state: State<'_, Arc<AppState>>,
+    input: ConnectionAuthorizeInput,
+) -> Result<AuthorizeOutcome, IpcError> {
+    state.authorize_connection(&input)
+}
+
 #[tauri::command]
 pub fn repository_discover(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: RepositoryDiscoverInput,
 ) -> Result<RepositoryPage, IpcError> {
     state.discover_repositories(&input.connection_id, &input.query)
@@ -75,7 +92,7 @@ pub fn repository_discover(
 
 #[tauri::command]
 pub fn repository_import(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: RepositoryImportInput,
 ) -> Result<RepositoryImportReport, IpcError> {
     state.import_repositories(&input)
@@ -83,7 +100,7 @@ pub fn repository_import(
 
 #[tauri::command]
 pub fn repository_probe_target(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: TargetProbeInput,
 ) -> Result<RepositorySnapshot, IpcError> {
     state.probe_target(&input)
@@ -91,7 +108,7 @@ pub fn repository_probe_target(
 
 #[tauri::command]
 pub fn repository_set_mapping(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: RepositoryMappingInput,
 ) -> Result<RepositorySnapshot, IpcError> {
     state.set_mapping(
@@ -103,7 +120,7 @@ pub fn repository_set_mapping(
 
 #[tauri::command]
 pub fn plan_preview(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: PlanPreviewRequest,
 ) -> Result<PlanPreviewSnapshot, IpcError> {
     state.preview_plan(&input)
@@ -114,7 +131,7 @@ pub fn plan_preview(
 /// self-authorise.
 #[tauri::command]
 pub fn plan_freeze(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: PlanFreezeInput,
 ) -> Result<PlanSnapshot, IpcError> {
     state.freeze_plan(&input)
@@ -124,7 +141,7 @@ pub fn plan_freeze(
 /// target state before a single remote write is scheduled.
 #[tauri::command]
 pub fn batch_start(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: BatchStartInput,
 ) -> Result<BatchSnapshot, IpcError> {
     state.start_batch(&input)
@@ -132,7 +149,7 @@ pub fn batch_start(
 
 #[tauri::command]
 pub fn batch_pause(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: BatchIdInput,
 ) -> Result<BatchSnapshot, IpcError> {
     state.set_control(&input, BatchControl::Paused)
@@ -140,7 +157,7 @@ pub fn batch_pause(
 
 #[tauri::command]
 pub fn batch_resume(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: BatchIdInput,
 ) -> Result<BatchSnapshot, IpcError> {
     state.set_control(&input, BatchControl::Running)
@@ -150,7 +167,7 @@ pub fn batch_resume(
 /// completed, and never deletes refs on the target.
 #[tauri::command]
 pub fn batch_cancel(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: BatchIdInput,
 ) -> Result<BatchSnapshot, IpcError> {
     state.set_control(&input, BatchControl::Cancelled)
@@ -158,7 +175,7 @@ pub fn batch_cancel(
 
 #[tauri::command]
 pub fn task_retry(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: TaskRetryInput,
 ) -> Result<RetryOutcome, IpcError> {
     state.retry_tasks(&input)
@@ -166,7 +183,7 @@ pub fn task_retry(
 
 #[tauri::command]
 pub fn report_snapshot(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: BatchIdInput,
 ) -> Result<ReportSnapshot, IpcError> {
     state.report(&input.batch_id)
@@ -174,7 +191,7 @@ pub fn report_snapshot(
 
 #[tauri::command]
 pub fn report_export(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     input: ReportExportInput,
 ) -> Result<ExportOutcome, IpcError> {
     state.export_report(&input)
@@ -232,6 +249,29 @@ mod tests {
                     .any(|name| name.starts_with(prefix)),
                 "no command covers {prefix}"
             );
+        }
+    }
+
+    /// The authorize command may only move a *name* and a *reference*. If its
+    /// payload ever grew a secret field the whole credential boundary would be
+    /// gone, so the shape is pinned here as well as in `ipc_contract.rs`.
+    #[test]
+    fn authorize_carries_a_name_in_and_a_reference_out() {
+        let input: ConnectionAuthorizeInput =
+            serde_json::from_str(r#"{"name":"source"}"#).expect("name accepted");
+        assert_eq!(input.name, "source");
+        assert!(serde_json::from_str::<ConnectionAuthorizeInput>(
+            r#"{"name":"source","token":"ghp-secret"}"#
+        )
+        .is_err());
+
+        let outcome = AuthorizeOutcome {
+            credential_ref: "credential/windows/abc12345".to_owned(),
+            instructions: "已打开凭据录入窗口".to_owned(),
+        };
+        let json = serde_json::to_string(&outcome).expect("serialised");
+        for forbidden in ["token", "secret", "password"] {
+            assert!(!json.contains(forbidden), "{forbidden} leaked into {json}");
         }
     }
 

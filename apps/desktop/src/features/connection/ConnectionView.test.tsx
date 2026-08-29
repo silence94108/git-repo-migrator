@@ -35,6 +35,10 @@ function sourcePanel() {
   return within(screen.getByRole("region", { name: "源平台" }));
 }
 
+function credentialRefInput(): HTMLInputElement {
+  return sourcePanel().getByLabelText(/凭据引用/) as HTMLInputElement;
+}
+
 describe("连接页表单模型", () => {
   it("拒绝带有内联凭据或不支持协议的地址", () => {
     expect(validateEndpoint("https://user:pass@git.example.test")).toContain("不得包含");
@@ -234,5 +238,64 @@ describe("连接页交互", () => {
     expect(panel.getByText("可迁移 Issues")).toBeTruthy();
     expect(panel.getAllByText("不支持").length).toBeGreaterThan(0);
     expect(panel.getByText("可写入 Git 数据")).toBeTruthy();
+  });
+});
+
+describe("本机凭据录入", () => {
+  it("只把凭据名称发给后端，并用返回的引用回填表单", async () => {
+    const bridge = new FakeBridge(snapshot()).on("connection_authorize", () => ({
+      credential_ref: "credential/windows/1a2b3c4d",
+      instructions: "已打开凭据录入窗口，请在该窗口中粘贴令牌两次",
+    }));
+    await mount(bridge);
+
+    fireEvent.click(sourcePanel().getByRole("button", { name: "录入令牌" }));
+
+    await waitFor(() => {
+      expect(bridge.countOf("connection_authorize")).toBe(1);
+    });
+    // The payload must be a name and nothing else: a token here would put a
+    // secret on the IPC boundary, which CM-004 forbids.
+    expect(bridge.inputFor("connection_authorize")).toEqual({ input: { name: "source" } });
+
+    await waitFor(() => {
+      expect(credentialRefInput().value).toBe("credential/windows/1a2b3c4d");
+    });
+    expect(screen.getAllByText("已打开本机凭据录入窗口").length).toBeGreaterThan(0);
+  });
+
+  it("录入窗口无法打开时给出可执行的下一步", async () => {
+    const bridge = new FakeBridge(snapshot()).failWith(
+      "connection_authorize",
+      ipcError({
+        code: "credential.companion_missing",
+        category: "validation",
+        retryable: false,
+        stage: "connection",
+        safe_message: "找不到凭据录入程序 git-repo-migrator-credential.exe",
+        action: "请重新安装应用；或在命令行中直接运行该程序录入凭据",
+      }),
+    );
+    await mount(bridge);
+
+    fireEvent.click(sourcePanel().getByRole("button", { name: "录入令牌" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/找不到凭据录入程序/)).toBeTruthy();
+    });
+    expect(screen.getByText(/请重新安装应用/)).toBeTruthy();
+    expect(credentialRefInput().value).toBe("");
+  });
+
+  it("界面上没有任何令牌输入框", async () => {
+    await mount(new FakeBridge(connectedSnapshot()));
+    // The page may *mention* tokens in its guidance, but must never offer a
+    // field that accepts one.
+    for (const input of Array.from(document.querySelectorAll("input"))) {
+      expect(input.type).not.toBe("password");
+      const label = input.labels?.[0]?.textContent ?? "";
+      expect(label).not.toMatch(/^令牌|访问令牌|密码/);
+    }
+    expect(connection().credential_ref).not.toMatch(/ghp_|glpat-/);
   });
 });
