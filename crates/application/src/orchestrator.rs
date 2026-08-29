@@ -89,6 +89,12 @@ impl Orchestrator {
         t.attempt = t.attempt.saturating_add(1);
         t.state = RepoTaskState::RetryableFailed;
         self.queue.push_back(id.to_owned());
+        // Re-queueing work reopens a batch that had run out of runnable tasks,
+        // matching the SQLite queue in `AppState::retry_tasks`. A paused batch
+        // stays paused so a retry never starts a stage on its own.
+        if self.control == BatchControl::Completed {
+            self.control = BatchControl::Running;
+        }
         true
     }
     pub fn task(&self, id: &str) -> Option<&QueueTask> {
