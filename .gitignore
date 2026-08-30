@@ -13,4 +13,6 @@ apps/desktop/vite.config.d.ts
 .env
 .env.*
 !.env.example
-src-tauri/binaries/
+# Staged credential-companion sidecar: the file carries the target triple, so
+# it is a build artifact (windows-ci.yml recreates it every run).
+/apps/desktop/src-tauri/binaries/
