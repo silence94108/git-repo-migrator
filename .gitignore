@@ -13,3 +13,4 @@ apps/desktop/vite.config.d.ts
 .env
 .env.*
 !.env.example
+src-tauri/binaries/
