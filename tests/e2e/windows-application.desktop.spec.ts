@@ -42,10 +42,28 @@ let app: ChildProcess | undefined;
 let browser: Browser | undefined;
 let dataDir: string | undefined;
 
+/** Set when the application process itself dies — the most common CI failure. */
+let appExit: { code: number | null; signal: string | null } | null = null;
+/** Tail of the application's own output; a panicked backend reports itself here. */
+let appOutput = "";
+
+/** Renders everything we know about the application process for error messages. */
+function appVitals(): string {
+  const exit = appExit
+    ? `the application exited (code ${appExit.code ?? "?"}, signal ${appExit.signal ?? "?"})`
+    : "the application process is still running";
+  const output = appOutput.trim()
+    ? `\n--- application output (tail) ---\n${appOutput.trim()}`
+    : "\nthe application produced no output";
+  return `${exit}.${output}`;
+}
+
 /** Launches the packaged application isolated in `dataDir`. */
 function launchApp(): ChildProcess {
   if (!dataDir) throw new Error("dataDir not initialised");
-  return spawn(BINARY as string, [], {
+  appExit = null;
+  appOutput = "";
+  const child = spawn(BINARY as string, [], {
     env: {
       ...process.env,
       // The WebView2 user-data folder decides which *browser process* hosts the
@@ -57,8 +75,25 @@ function launchApp(): ChildProcess {
       LOCALAPPDATA: dataDir,
       APPDATA: dataDir,
     },
-    stdio: "ignore",
+    // A GUI application rarely writes here, but a panic on startup does. The
+    // tail is reported when the debugging endpoint never appears — without it
+    // a crashed backend is indistinguishable from a missing port.
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  const collect = (chunk: Buffer) => {
+    appOutput = (appOutput + chunk.toString("utf8")).slice(-4000);
+  };
+  child.stdout?.on("data", collect);
+  child.stderr?.on("data", collect);
+  // Assign before wiring the exit handler: a process that dies immediately
+  // (missing loader, bad architecture) must still record its exit.
+  app = child;
+  // Only the *current* instance updates the vitals: the restart test kills an
+  // old child whose exit event may land after the replacement has launched.
+  child.on("exit", (code, signal) => {
+    if (app === child) appExit = { code, signal };
+  });
+  return child;
 }
 
 /** Waits for WebView2 to publish its debugging endpoint. */
@@ -66,6 +101,13 @@ async function connect(): Promise<Browser> {
   const deadline = Date.now() + 60_000;
   let lastError: unknown;
   while (Date.now() < deadline) {
+    if (appExit) {
+      // The host is gone — no amount of retrying will open the port.
+      throw new Error(
+        `the packaged application died before WebView2 published its debugging endpoint. ` +
+          `${appVitals()}`,
+      );
+    }
     try {
       return await chromium.connectOverCDP(CDP_ENDPOINT);
     } catch (cause) {
@@ -73,7 +115,9 @@ async function connect(): Promise<Browser> {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
-  throw new Error(`could not attach to WebView2 at ${CDP_ENDPOINT}: ${String(lastError)}`);
+  throw new Error(
+    `could not attach to WebView2 at ${CDP_ENDPOINT}: ${String(lastError)}. ${appVitals()}`,
+  );
 }
 
 async function appPage(): Promise<Page> {
