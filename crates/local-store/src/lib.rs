@@ -11,7 +11,9 @@ use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/0001_initial.sql");
-const SCHEMA_VERSION: i64 = 1;
+const WORKSPACE_POLICY_MIGRATION: &str =
+    include_str!("../../../migrations/0002_batch_workspace_policy.sql");
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -61,9 +63,15 @@ impl LocalStore {
 
         match version {
             SCHEMA_VERSION => Ok(()),
-            0 => {
+            0 | 1 => {
                 let transaction = self.connection.transaction()?;
-                transaction.execute_batch(INITIAL_MIGRATION)?;
+                if version == 0 {
+                    transaction.execute_batch(INITIAL_MIGRATION)?;
+                }
+                // Version 1 stores know nothing of the workspace policy; the
+                // column is added with the safe default so old batches keep the
+                // behaviour they were started with.
+                transaction.execute_batch(WORKSPACE_POLICY_MIGRATION)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())

@@ -73,7 +73,7 @@ fn migration_is_idempotent_enables_integrity_and_has_no_secret_columns() {
     let mut store = LocalStore::open(&database).unwrap();
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
     assert_eq!(
         store
             .connection()
