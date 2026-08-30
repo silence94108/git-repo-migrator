@@ -61,6 +61,9 @@ export default defineConfig({
       // The spec launches the packaged application itself and attaches over the
       // WebView2 debugging endpoint, so there is no connectOptions here: a
       // config-level endpoint would have to exist before the app is started.
+      // All tests share one application instance (one fixed CDP port), so the
+      // file must never be split across parallel workers.
+      fullyParallel: false,
       use: { ...devices["Desktop Chrome"] },
     },
   ],

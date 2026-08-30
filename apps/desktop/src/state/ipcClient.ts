@@ -93,9 +93,16 @@ export async function call<T>(
 /** Production bridge. Imported lazily so tests never load the Tauri runtime. */
 export function createTauriBridge(): MigrationBridge {
   return {
+    // Callers pass the command's *argument object* (e.g. `{ input: {...} }`,
+    // matching the Rust parameter name `input`); Tauri matches its arguments
+    // by name, so the object is forwarded verbatim. Wrapping it here once
+    // more produced `{ input: { input: {...} } }`, which the commands'
+    // `deny_unknown_fields` structs reject — every payload-carrying command
+    // in the packaged app failed with "unknown field `input`" until this
+    // was caught by the desktop E2E run.
     async invoke<T>(command: CommandName, input?: unknown): Promise<T> {
       const { invoke } = await import("@tauri-apps/api/core");
-      return invoke<T>(command, input === undefined ? undefined : { input });
+      return invoke<T>(command, input as Record<string, unknown> | undefined);
     },
     subscribe(listener) {
       let dispose: (() => void) | undefined;

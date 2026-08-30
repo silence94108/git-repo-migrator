@@ -173,13 +173,16 @@ jobs:
             "apps/desktop/src-tauri/binaries/git-repo-migrator-credential-$triple.exe" -Force
 
       - name: Build application
-        run: npm run tauri build -- --no-bundle
+        # The E2E window config adds the WebView2 debugging port; the production
+        # build keeps default browser arguments.
+        run: npm run tauri build -- --no-bundle --config src-tauri/tauri.e2e.conf.json
         working-directory: apps/desktop
 
       - name: Desktop E2E
         env:
-          E2E_TAURI_BINARY: apps\desktop\src-tauri\target\release\git-repo-migrator.exe
+          E2E_TAURI_BINARY: target\release\git-repo-migrator-desktop.exe
         run: npm run e2e:desktop
+        working-directory: apps/desktop
 
       - uses: actions/upload-artifact@v4
         if: always()

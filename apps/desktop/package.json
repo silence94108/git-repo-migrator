@@ -11,7 +11,9 @@
     "tauri": "tauri",
     "build:e2e": "vite build --mode e2e --outDir dist-e2e",
     "preview:e2e": "vite preview --outDir dist-e2e --host 127.0.0.1 --port 4173 --strictPort",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "e2e:webview": "playwright test --project=webview",
+    "e2e:desktop": "playwright test --project=desktop"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

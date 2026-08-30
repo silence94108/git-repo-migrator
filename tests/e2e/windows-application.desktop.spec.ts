@@ -5,13 +5,15 @@
  * real Rust backend, the real SQLite file and the real command surface, driven
  * through the WebView2 debugging endpoint.
  *
- * It needs a built executable, so it is skipped unless `E2E_TAURI_BINARY` points
- * at one:
+ * It needs an executable built with the E2E window config, because the
+ * debugging port cannot be injected at runtime: wry passes its own browser
+ * arguments, so `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` is ignored by the
+ * WebView2 loader. Build it like this:
  *
  * ```
- * npm run tauri build --prefix apps/desktop
- * set E2E_TAURI_BINARY=apps\desktop\src-tauri\target\release\git-repo-migrator.exe
- * npm run e2e:desktop
+ * npx tauri build --prefix apps/desktop --no-bundle --config src-tauri/tauri.e2e.conf.json
+ * set E2E_TAURI_BINARY=target\release\git-repo-migrator-desktop.exe
+ * npx playwright test --project=desktop
  * ```
  *
  * A skip here is not a pass. `docs/release-checklist.md` requires a recorded run
@@ -39,6 +41,25 @@ test.skip(
 let app: ChildProcess | undefined;
 let browser: Browser | undefined;
 let dataDir: string | undefined;
+
+/** Launches the packaged application isolated in `dataDir`. */
+function launchApp(): ChildProcess {
+  if (!dataDir) throw new Error("dataDir not initialised");
+  return spawn(BINARY as string, [], {
+    env: {
+      ...process.env,
+      // The WebView2 user-data folder decides which *browser process* hosts the
+      // window. Tauri resolves it through the Windows known-folder API, which
+      // ignores LOCALAPPDATA/APPDATA, so it has to be overridden explicitly —
+      // otherwise the run attaches to a developer's already-running browser
+      // process and the debugging port never appears.
+      WEBVIEW2_USER_DATA_FOLDER: join(dataDir, "webview"),
+      LOCALAPPDATA: dataDir,
+      APPDATA: dataDir,
+    },
+    stdio: "ignore",
+  });
+}
 
 /** Waits for WebView2 to publish its debugging endpoint. */
 async function connect(): Promise<Browser> {
@@ -69,22 +90,25 @@ test.beforeAll(async () => {
   // A dedicated app-data directory keeps the run from touching a developer's
   // real migration state, and lets the restart test start from a known state.
   dataDir = mkdtempSync(join(tmpdir(), "git-repo-migrator-e2e-"));
-  app = spawn(BINARY, [], {
-    env: {
-      ...process.env,
-      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}`,
-      LOCALAPPDATA: dataDir,
-      APPDATA: dataDir,
-    },
-    stdio: "ignore",
-  });
+  app = launchApp();
   browser = await connect();
 });
 
 test.afterAll(async () => {
   await browser?.close().catch(() => undefined);
   app?.kill();
-  if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  if (dataDir) {
+    // WebView2's crashpad handler outlives its host for a moment and keeps
+    // metrics files locked; retry the removal instead of failing the run.
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        rmSync(dataDir, { recursive: true, force: true });
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+  }
 });
 
 test.describe("打包后的 Windows 应用", () => {
@@ -138,15 +162,7 @@ test.describe("打包后的 Windows 应用", () => {
     await browser?.close().catch(() => undefined);
     app?.kill();
     await new Promise((resolve) => setTimeout(resolve, 2000));
-    app = spawn(BINARY as string, [], {
-      env: {
-        ...process.env,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${DEBUG_PORT}`,
-        LOCALAPPDATA: dataDir as string,
-        APPDATA: dataDir as string,
-      },
-      stdio: "ignore",
-    });
+    app = launchApp();
     browser = await connect();
 
     const restarted = await appPage();
