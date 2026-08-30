@@ -34,7 +34,13 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   workers: process.env.CI ? 2 : undefined,
   reporter: process.env.CI
-    ? [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]]
+    ? [
+        ["list"],
+        ["html", { outputFolder: "playwright-report", open: "never" }],
+        // Consumed by the CI "surface failures" step: GitHub annotations let
+        // the failure reason be read without downloading an artifact.
+        ["json", { outputFile: "playwright-report/results.json" }],
+      ]
     : [["list"]],
   outputDir: "test-results",
 

@@ -126,6 +126,11 @@ jobs:
       - name: Run E2E
         run: npm run e2e:webview
 
+      - name: Surface test failures as annotations
+        if: failure()
+        run: node ../../tests/e2e/annotate-failures.mjs playwright-report/results.json
+        working-directory: apps/desktop
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -180,8 +185,15 @@ jobs:
 
       - name: Desktop E2E
         env:
-          E2E_TAURI_BINARY: target\release\git-repo-migrator-desktop.exe
+          # Absolute: cargo puts the workspace binary in the repository root's
+          # target/, while this step runs from apps/desktop.
+          E2E_TAURI_BINARY: ${{ github.workspace }}\target\release\git-repo-migrator-desktop.exe
         run: npm run e2e:desktop
+        working-directory: apps/desktop
+
+      - name: Surface test failures as annotations
+        if: failure()
+        run: node ../../tests/e2e/annotate-failures.mjs playwright-report/results.json
         working-directory: apps/desktop
 
       - uses: actions/upload-artifact@v4
