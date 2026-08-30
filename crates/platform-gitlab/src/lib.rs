@@ -71,32 +71,12 @@ fn invalid_response() -> PlatformError {
         retry_after_seconds: None,
     }
 }
-fn version_at_least(version: &str, major: u64, minor: u64) -> bool {
-    let mut it = version.split('.').filter_map(|v| v.parse::<u64>().ok());
-    (it.next().unwrap_or(0), it.next().unwrap_or(0)) >= (major, minor)
-}
 fn capability_matrix(version: Option<String>) -> CapabilityMatrix {
     let native = |scopes: &[&str]| Capability::native(scopes.iter().copied());
-    let mr = if version
-        .as_deref()
-        .is_none_or(|v| version_at_least(v, 12, 0))
-    {
-        native(&["api"])
-    } else {
-        Capability {
-            degradation: Some("旧版实例仅归档 MR".into()),
-            fidelity: Fidelity::ReadOnlyArchive,
-            ..native(&["read_api"])
-        }
-    };
-    let releases = if version
-        .as_deref()
-        .is_none_or(|v| version_at_least(v, 11, 7))
-    {
-        native(&["api"])
-    } else {
-        Capability::unsupported("实例版本不支持稳定 Release API")
-    };
+    // No GitLab data module is wired to a real migration yet; the capability
+    // rows say so instead of promising a native rebuild nothing performs.
+    let not_migrated =
+        |module: &str| Capability::unsupported(format!("本版本未实现 GitLab 的 {module} 迁移"));
     CapabilityMatrix {
         schema_version: 1,
         platform: PlatformKind::Gitlab,
@@ -109,12 +89,12 @@ fn capability_matrix(version: Option<String>) -> CapabilityMatrix {
         git_write: native(&["write_repository"]),
         lfs: native(&["write_repository"]),
         metadata: native(&["api"]),
-        issues: native(&["api"]),
+        issues: not_migrated("Issue"),
         pull_requests: Capability::unsupported("GitLab 使用 Merge Request"),
-        merge_requests: mr,
-        wiki: native(&["api"]),
-        releases: releases.clone(),
-        release_assets: releases,
+        merge_requests: not_migrated("Merge Request"),
+        wiki: not_migrated("Wiki"),
+        releases: not_migrated("Release"),
+        release_assets: not_migrated("Release 附件"),
     }
 }
 fn repository(v: &Value) -> Option<RepositoryCandidate> {
@@ -192,6 +172,9 @@ fn empty_module(module: PlatformModule, fidelity: Fidelity) -> ModuleResult {
         failed: 0,
         warnings: vec![],
         item_mappings: Default::default(),
+        source_links: vec![],
+        archive: None,
+        unmapped_fields: vec![],
     }
 }
 
@@ -326,6 +309,7 @@ impl PlatformAdapter for GitlabAdapter {
             visibility: Some(candidate.visibility),
             default_branch: candidate.default_branch,
             permissions: Some(candidate.permissions),
+            description: candidate.description,
         })
     }
     async fn create_repository(
@@ -382,18 +366,18 @@ impl PlatformAdapter for GitlabAdapter {
     async fn migrate_module(
         &self,
         _ctx: &AdapterContext<'_>,
+        _target_ctx: &AdapterContext<'_>,
         module: PlatformModule,
         _source: &RemoteRepository,
         _target: &RemoteRepository,
     ) -> Result<ModuleResult, PlatformError> {
-        Ok(empty_module(
-            module,
-            if matches!(module, PlatformModule::PullRequests) {
-                Fidelity::Unsupported
-            } else {
-                Fidelity::NativeRebuild
-            },
-        ))
+        // Nothing is wired yet; saying `Unsupported` keeps the report honest
+        // instead of claiming a native rebuild that migrated nothing.
+        let mut result = empty_module(module, Fidelity::Unsupported);
+        result
+            .warnings
+            .push(format!("本版本未实现 GitLab 的 {module:?} 迁移"));
+        Ok(result)
     }
     async fn verify_module(
         &self,

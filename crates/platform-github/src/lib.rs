@@ -1,7 +1,24 @@
 use async_trait::async_trait;
+use git_repo_migrator_platform_core::archive::{ArchiveDocument, ArchiveItem};
 use git_repo_migrator_platform_core::*;
 use serde_json::{json, Value};
 use url::Url;
+
+fn empty_module(module: PlatformModule, fidelity: Fidelity) -> ModuleResult {
+    ModuleResult {
+        module,
+        fidelity,
+        discovered: 0,
+        migrated: 0,
+        archived: 0,
+        failed: 0,
+        warnings: vec![],
+        item_mappings: Default::default(),
+        source_links: vec![],
+        archive: None,
+        unmapped_fields: vec![],
+    }
+}
 
 pub struct GithubAdapter;
 impl GithubAdapter {
@@ -86,6 +103,15 @@ fn cap(platform: PlatformKind, version: Option<String>) -> CapabilityMatrix {
         capability.version = version.clone();
         capability
     };
+    // GitHub exposes no issue-import API, so issues and PRs can only be read
+    // and archived — never rebuilt as interactive target items.
+    let read_only_archive = |module: &str| {
+        let mut capability = Capability::native(["repo"]);
+        capability.version = version.clone();
+        capability.degradation = Some(format!("GitHub 未提供 {module} 导入 API，迁移为只读归档"));
+        capability.fidelity = Fidelity::ReadOnlyArchive;
+        capability
+    };
     CapabilityMatrix {
         schema_version: 1,
         platform,
@@ -98,12 +124,12 @@ fn cap(platform: PlatformKind, version: Option<String>) -> CapabilityMatrix {
         git_write: native(&["repo"]),
         lfs: native(&["repo"]),
         metadata: native(&["repo"]),
-        issues: native(&["repo"]),
-        pull_requests: native(&["repo"]),
+        issues: read_only_archive("Issue"),
+        pull_requests: read_only_archive("Pull Request"),
         merge_requests: Capability::unsupported("GitHub 使用 Pull Request"),
-        wiki: native(&["repo"]),
-        releases: native(&["repo"]),
-        release_assets: native(&["repo"]),
+        wiki: Capability::unsupported("本版本未接入 GitHub Wiki 迁移"),
+        releases: Capability::unsupported("本版本未实现 GitHub Release 迁移"),
+        release_assets: Capability::unsupported("本版本未实现 GitHub Release 附件迁移"),
     }
 }
 fn candidate(v: &Value) -> Option<RepositoryCandidate> {
@@ -299,6 +325,10 @@ impl PlatformAdapter for GithubAdapter {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             }),
+            description: v
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
     async fn create_repository(
@@ -391,30 +421,41 @@ impl PlatformAdapter for GithubAdapter {
             failed: 0,
             warnings: vec![],
             item_mappings: Default::default(),
+            source_links: vec![],
+            archive: None,
+            unmapped_fields: vec![],
         })
     }
+    fn module_fidelity(&self, module: PlatformModule) -> Fidelity {
+        match module {
+            // GitHub has no issue-import API: items can be read and archived,
+            // never rebuilt as native, interactive entries.
+            PlatformModule::Issues | PlatformModule::PullRequests => Fidelity::ReadOnlyArchive,
+            _ => Fidelity::Unsupported,
+        }
+    }
+
     async fn migrate_module(
         &self,
-        _ctx: &AdapterContext<'_>,
+        ctx: &AdapterContext<'_>,
+        _target_ctx: &AdapterContext<'_>,
         module: PlatformModule,
-        _source: &RemoteRepository,
+        source: &RemoteRepository,
         _target: &RemoteRepository,
     ) -> Result<ModuleResult, PlatformError> {
-        let fidelity = if matches!(module, PlatformModule::MergeRequests) {
-            Fidelity::Unsupported
-        } else {
-            Fidelity::NativeRebuild
-        };
-        Ok(ModuleResult {
-            module,
-            fidelity,
-            discovered: 0,
-            migrated: 0,
-            archived: 0,
-            failed: 0,
-            warnings: vec![],
-            item_mappings: Default::default(),
-        })
+        match module {
+            PlatformModule::Issues | PlatformModule::PullRequests => {
+                archive_items(ctx, module, &source.locator.full_name).await
+            }
+            other => {
+                let mut result = empty_module(other, Fidelity::Unsupported);
+                result.warnings.push(format!(
+                    "本版本未实现 GitHub 的 {} 迁移",
+                    module_text(other)
+                ));
+                Ok(result)
+            }
+        }
     }
     async fn verify_module(
         &self,
@@ -430,5 +471,135 @@ impl PlatformAdapter for GithubAdapter {
             actual_count: Some(0),
             mismatches: vec![],
         })
+    }
+}
+
+/// Lists a repository's issues and PRs (GitHub serves both from `/issues`;
+/// the `pull_request` key separates them), with their comments, and archives
+/// them read-only.
+async fn archive_items(
+    ctx: &AdapterContext<'_>,
+    module: PlatformModule,
+    full_name: &str,
+) -> Result<ModuleResult, PlatformError> {
+    let mut result = empty_module(module, Fidelity::ReadOnlyArchive);
+    let wants_pull_requests = module == PlatformModule::PullRequests;
+    let mut items: Vec<ArchiveItem> = Vec::new();
+    let mut page = 1_u32;
+    loop {
+        let url = format!(
+            "{}/repos/{full_name}/issues?state=all&per_page=100&page={page}",
+            api_base(ctx.endpoint)
+        );
+        let (value, _) = send(ctx, request("GET", url, None, ctx.credential_ref)).await?;
+        let batch = value.as_array().cloned().unwrap_or_default();
+        let fetched = batch.len();
+        for issue in batch {
+            let is_pull_request = issue.get("pull_request").is_some();
+            if is_pull_request != wants_pull_requests {
+                continue;
+            }
+            let html_url = issue
+                .get("html_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            result.source_links.push(html_url.clone());
+            let mut body = issue
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            // Comments are folded into the archived body: an archive document
+            // is a flat record, and losing the discussion would not be honest.
+            let comments = list_comments(ctx, full_name, &issue).await;
+            if !comments.is_empty() {
+                body.push_str("\n\n---\n评论：\n");
+                for comment in &comments {
+                    let author = comment
+                        .pointer("/user/login")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let text = comment
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    body.push_str(&format!("\n[{author}] {text}\n"));
+                }
+            }
+            let mut metadata = std::collections::BTreeMap::new();
+            if let Some(labels) = issue.get("labels").and_then(Value::as_array) {
+                let names: Vec<String> = labels
+                    .iter()
+                    .filter_map(|label| label.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect();
+                if !names.is_empty() {
+                    metadata.insert("labels".to_owned(), names.join(","));
+                }
+            }
+            items.push(ArchiveItem {
+                source_id: issue
+                    .get("number")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    .to_string(),
+                source_url: html_url,
+                title: issue
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                body,
+                source_author: issue
+                    .pointer("/user/login")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                state: issue
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                attachments: vec![],
+                metadata,
+            });
+        }
+        if fetched < 100 {
+            break;
+        }
+        page += 1;
+    }
+    result.discovered = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    result.archived = result.discovered;
+    result.archive = Some(ArchiveDocument::new("", "", full_name, module, items));
+    Ok(result)
+}
+
+async fn list_comments(ctx: &AdapterContext<'_>, full_name: &str, issue: &Value) -> Vec<Value> {
+    let Some(number) = issue.get("number").and_then(Value::as_i64) else {
+        return Vec::new();
+    };
+    let url = format!(
+        "{}/repos/{full_name}/issues/{number}/comments?per_page=100",
+        api_base(ctx.endpoint)
+    );
+    match send(ctx, request("GET", url, None, ctx.credential_ref)).await {
+        Ok((value, _)) => value.as_array().cloned().unwrap_or_default(),
+        // Comment retrieval failing degrades the archive body, it does not
+        // lose the issue itself.
+        Err(_) => Vec::new(),
+    }
+}
+
+fn module_text(module: PlatformModule) -> &'static str {
+    match module {
+        PlatformModule::Metadata => "元数据",
+        PlatformModule::Issues => "Issue",
+        PlatformModule::PullRequests => "Pull Request",
+        PlatformModule::MergeRequests => "Merge Request",
+        PlatformModule::Wiki => "Wiki",
+        PlatformModule::Releases => "Release",
+        PlatformModule::ReleaseAssets => "Release 附件",
     }
 }

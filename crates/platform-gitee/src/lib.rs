@@ -63,6 +63,10 @@ async fn send(
 }
 fn caps() -> CapabilityMatrix {
     let native = |s: &[&str]| Capability::native(s.iter().copied());
+    // No Gitee data module is wired to a real migration yet; the capability
+    // rows say so instead of promising a fidelity nothing performs.
+    let not_migrated =
+        |module: &str| Capability::unsupported(format!("本版本未实现 Gitee 的 {module} 迁移"));
     CapabilityMatrix {
         schema_version: 1,
         platform: PlatformKind::Gitee,
@@ -75,20 +79,12 @@ fn caps() -> CapabilityMatrix {
         git_write: native(&["projects"]),
         lfs: native(&["projects"]),
         metadata: native(&["projects"]),
-        issues: native(&["issues"]),
-        pull_requests: Capability {
-            degradation: Some("跨平台身份和部分状态改为只读归档".into()),
-            fidelity: Fidelity::ReadOnlyArchive,
-            ..native(&["pull_requests"])
-        },
+        issues: not_migrated("Issue"),
+        pull_requests: not_migrated("Pull Request"),
         merge_requests: Capability::unsupported("Gitee 使用 Pull Request"),
-        wiki: Capability::unsupported("Gitee Wiki API 不稳定"),
-        releases: native(&["projects"]),
-        release_assets: Capability {
-            degradation: Some("附件失败时保留源链接".into()),
-            fidelity: Fidelity::ReadOnlyArchive,
-            ..native(&["projects"])
-        },
+        wiki: not_migrated("Wiki"),
+        releases: not_migrated("Release"),
+        release_assets: not_migrated("Release 附件"),
     }
 }
 fn repo(v: &Value) -> Option<RepositoryCandidate> {
@@ -154,6 +150,9 @@ fn module(m: PlatformModule, f: Fidelity) -> ModuleResult {
         failed: 0,
         warnings: vec![],
         item_mappings: Default::default(),
+        source_links: vec![],
+        archive: None,
+        unmapped_fields: vec![],
     }
 }
 #[async_trait]
@@ -269,6 +268,7 @@ impl PlatformAdapter for GiteeAdapter {
             visibility: Some(c.visibility),
             default_branch: c.default_branch,
             permissions: Some(c.permissions),
+            description: c.description,
         })
     }
     async fn create_repository(
@@ -317,18 +317,18 @@ impl PlatformAdapter for GiteeAdapter {
     async fn migrate_module(
         &self,
         _ctx: &AdapterContext<'_>,
+        _target_ctx: &AdapterContext<'_>,
         m: PlatformModule,
         _source: &RemoteRepository,
         _target: &RemoteRepository,
     ) -> Result<ModuleResult, PlatformError> {
-        let fidelity = match m {
-            PlatformModule::Issues | PlatformModule::Releases => Fidelity::NativeRebuild,
-            PlatformModule::PullRequests | PlatformModule::ReleaseAssets => {
-                Fidelity::ReadOnlyArchive
-            }
-            _ => Fidelity::Unsupported,
-        };
-        Ok(module(m, fidelity))
+        // Nothing is wired yet; saying `Unsupported` keeps the report honest
+        // instead of claiming a native rebuild that migrated nothing.
+        let mut result = module(m, Fidelity::Unsupported);
+        result
+            .warnings
+            .push(format!("本版本未实现 Gitee 的 {m:?} 迁移"));
+        Ok(result)
     }
     async fn verify_module(
         &self,
