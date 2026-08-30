@@ -29,6 +29,7 @@ use git_repo_migrator_git_runner::{
 use git_repo_migrator_workspace::{Workspace, WorkspaceError};
 use serde::{Deserialize, Serialize};
 
+use crate::archive::ArchiveDocument;
 use crate::ipc_contract::IpcError;
 use crate::orchestrator::BatchControl;
 use crate::planning::TargetState;
@@ -132,6 +133,29 @@ impl TaskAssignment {
     }
 }
 
+/// What the operator asked to happen to the workspace (FR-011).
+///
+/// * `Reuse` — a failed attempt keeps its temporary mirror so the operator can
+///   inspect what was fetched; the report marks the retained path.
+/// * `Clean` — stale temporary directories of the same task are purged before
+///   the clone, and the mirror is deleted even after a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspacePolicy {
+    #[default]
+    Reuse,
+    Clean,
+}
+
+impl WorkspacePolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reuse" => Some(Self::Reuse),
+            "clean" => Some(Self::Clean),
+            _ => None,
+        }
+    }
+}
+
 /// One platform module's outcome, as the executor observed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleReport {
@@ -141,6 +165,13 @@ pub struct ModuleReport {
     pub target_count: u64,
     pub source_links: Vec<String>,
     pub error: Option<IpcError>,
+    /// The read-only archive a `ReadOnlyArchive` module produced. The executor
+    /// persists it under the workspace before the task may complete; claiming a
+    /// fidelity without delivering the document would be a lie.
+    pub archive: Option<ArchiveDocument>,
+    /// Source content that could not be mapped onto the target, with the
+    /// reason. Flows into the report's unmapped-fields column.
+    pub unmapped_fields: Vec<String>,
 }
 
 impl ModuleReport {
@@ -152,8 +183,39 @@ impl ModuleReport {
             target_count: 0,
             source_links: Vec::new(),
             error: Some(unsupported_error(module, reason)),
+            archive: None,
+            unmapped_fields: Vec::new(),
         }
     }
+}
+
+/// Everything the verify stage hands to the recorder at completion time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCompletion {
+    pub verification: VerificationResult,
+    /// Workspace-relative directory holding this task's archive documents,
+    /// present only when at least one module archived something.
+    pub archive_dir: Option<String>,
+    pub unmapped_fields: Vec<String>,
+}
+
+impl TaskCompletion {
+    pub fn from_verification(verification: VerificationResult) -> Self {
+        Self {
+            verification,
+            archive_dir: None,
+            unmapped_fields: Vec::new(),
+        }
+    }
+}
+
+/// What happened to a task's temporary directory (FR-011: the report has to
+/// show the cleanup result, including a deliberate retention).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TempDirOutcome {
+    Cleaned,
+    Retained,
+    Failed(String),
 }
 
 /// Result of one repository's run.
@@ -193,13 +255,13 @@ pub trait StageRecorder: Send + Sync {
         &self,
         task_id: &str,
         owner: &str,
-        result: &VerificationResult,
+        completion: &TaskCompletion,
     ) -> Result<(), IpcError>;
     /// Current batch control. Polled between stages so pause and cancel take
     /// effect at a checkpoint instead of mid-push.
     fn control(&self, batch_id: &str) -> BatchControl;
     /// Reports what happened to the task's temporary directory.
-    fn cleanup(&self, task_id: &str, path: &Path, failure: Option<&str>);
+    fn cleanup(&self, task_id: &str, path: &Path, outcome: TempDirOutcome);
 }
 
 /// Reads and, when the plan says so, creates the target repository.
@@ -257,6 +319,7 @@ pub struct StageExecutor {
     timeout: Duration,
     min_free_bytes: u64,
     lfs_available: bool,
+    workspace_policy: WorkspacePolicy,
 }
 
 impl StageExecutor {
@@ -277,6 +340,7 @@ impl StageExecutor {
             timeout: Duration::from_secs(30 * 60),
             min_free_bytes: DEFAULT_MIN_FREE_BYTES,
             lfs_available: false,
+            workspace_policy: WorkspacePolicy::Reuse,
         }
     }
 
@@ -309,6 +373,12 @@ impl StageExecutor {
     /// degrades to `Unsupported` with a reason instead of failing the task.
     pub fn with_lfs(mut self, available: bool) -> Self {
         self.lfs_available = available;
+        self
+    }
+
+    /// Sets what happens to the workspace across attempts (FR-011).
+    pub fn with_workspace_policy(mut self, policy: WorkspacePolicy) -> Self {
+        self.workspace_policy = policy;
         self
     }
 
@@ -348,7 +418,8 @@ impl StageExecutor {
             // `skip_non_empty` is a decision, not a failure: no bytes were
             // written to the target and the report says exactly why.
             let result = skipped_result();
-            self.record_complete(assignment, &result)?;
+            let completion = TaskCompletion::from_verification(result.clone());
+            self.record_complete(assignment, &completion)?;
             return Ok(TaskExecution {
                 task_id: assignment.task_id.clone(),
                 status: AggregateStatus::Skipped,
@@ -360,13 +431,30 @@ impl StageExecutor {
         };
 
         let outcome = self.run_stages(assignment, &mirror.repo, modules);
+        // Archives are persisted even when a later stage failed: the items were
+        // fetched and the report may still point at them. An archive that never
+        // reached disk fails the task instead of silently disappearing.
+        let archive_dir = match self.persist_archives(modules) {
+            Ok(dir) => dir,
+            Err(failure) => {
+                self.cleanup_after(assignment, &mirror.temp_root, true);
+                return Err(failure);
+            }
+        };
         // The workspace is cleaned whether or not the stages succeeded, so a
-        // failed batch does not leave the disk full for the next attempt.
-        self.cleanup(&assignment.task_id, &mirror.temp_root);
+        // failed batch does not leave the disk full for the next attempt —
+        // unless the operator chose to keep failed mirrors (FR-011).
+        let failed = outcome.is_err();
+        self.cleanup_after(assignment, &mirror.temp_root, failed);
         let source_refs = outcome?;
 
         let verification = self.verify(assignment, &source_refs, modules)?;
-        self.record_complete(assignment, &verification)?;
+        let completion = TaskCompletion {
+            unmapped_fields: unmapped_fields(modules),
+            archive_dir,
+            verification: verification.clone(),
+        };
+        self.record_complete(assignment, &completion)?;
         Ok(TaskExecution {
             task_id: assignment.task_id.clone(),
             status: verification.status,
@@ -486,6 +574,17 @@ impl StageExecutor {
                 stage,
                 error: workspace_error(stage, &error),
             })?;
+        if self.workspace_policy == WorkspacePolicy::Clean {
+            // Under `clean`, leftovers from a crashed attempt of *this* task are
+            // removed before the clone. The prefix is task-specific, so a
+            // concurrent task in another worker is never touched.
+            self.workspace
+                .purge_temp_for(&sanitize_id(&assignment.task_id))
+                .map_err(|error| StageFailure {
+                    stage,
+                    error: workspace_error(stage, &error),
+                })?;
+        }
         let temp_root = self
             .workspace
             .temp_dir(&sanitize_id(&assignment.task_id))
@@ -563,43 +662,58 @@ impl StageExecutor {
         if !self.lfs_available {
             // Missing tooling degrades the module; it does not silently drop
             // LFS objects while reporting a complete success.
-            let report = ModuleReport::unsupported("lfs", "本机未安装 git-lfs，LFS 对象未迁移");
+            let mut report = ModuleReport::unsupported("lfs", "本机未安装 git-lfs，LFS 对象未迁移");
+            report.unmapped_fields.push("lfs_objects".to_owned());
             self.record_module(assignment, report, modules)?;
             return Ok(());
         }
 
-        let fetch = self.run_lfs(
-            &["lfs".to_owned(), "fetch".to_owned(), "--all".to_owned()],
-            Some(mirror),
-        );
+        // The commands run the `git-lfs` executable directly (`run_lfs`), so
+        // they carry no `lfs` prefix — that prefix belongs to `git lfs`, and
+        // `git-lfs lfs fetch` is an unknown command.
+        let fetch = self.run_lfs(&["fetch".to_owned(), "--all".to_owned()], Some(mirror));
         let push = fetch.and_then(|_| {
             self.run_lfs(
                 &[
-                    "lfs".to_owned(),
                     "push".to_owned(),
                     "--all".to_owned(),
-                    assignment.target_url.clone(),
+                    lfs_remote_url(&assignment.target_url),
                 ],
                 Some(mirror),
             )
         });
         let report = match push {
-            Ok(_) => ModuleReport {
-                module: "lfs".to_owned(),
-                fidelity: Fidelity::NativeRebuild,
-                source_count: 0,
-                target_count: 0,
-                source_links: Vec::new(),
-                error: None,
-            },
-            Err(error) => ModuleReport {
-                module: "lfs".to_owned(),
-                fidelity: Fidelity::Unsupported,
-                source_count: 0,
-                target_count: 0,
-                source_links: Vec::new(),
-                error: Some(git_error(stage, &error)),
-            },
+            Ok(_) => {
+                // `push --all` moves every fetched object, so the mirror's count
+                // is both the source and the target figure. Counting the real
+                // object files keeps the report honest even when LFS reports
+                // nothing on stdout.
+                let objects = count_lfs_objects(mirror);
+                ModuleReport {
+                    module: "lfs".to_owned(),
+                    fidelity: Fidelity::NativeRebuild,
+                    source_count: objects,
+                    target_count: objects,
+                    source_links: Vec::new(),
+                    error: None,
+                    archive: None,
+                    unmapped_fields: Vec::new(),
+                }
+            }
+            Err(error) => {
+                let mut report = ModuleReport {
+                    module: "lfs".to_owned(),
+                    fidelity: Fidelity::Unsupported,
+                    source_count: count_lfs_objects(mirror),
+                    target_count: 0,
+                    source_links: Vec::new(),
+                    error: Some(git_error(stage, &error)),
+                    archive: None,
+                    unmapped_fields: Vec::new(),
+                };
+                report.unmapped_fields.push("lfs_objects".to_owned());
+                report
+            }
         };
         self.record_module(assignment, report, modules)
     }
@@ -625,6 +739,8 @@ impl StageExecutor {
                 target_count: 0,
                 source_links: Vec::new(),
                 error: Some(error),
+                archive: None,
+                unmapped_fields: Vec::new(),
             });
         self.record_module(assignment, report, modules)
     }
@@ -654,6 +770,8 @@ impl StageExecutor {
                     target_count: 0,
                     source_links: Vec::new(),
                     error: Some(error),
+                    archive: None,
+                    unmapped_fields: Vec::new(),
                 });
             self.record_module(assignment, report, modules)?;
             let completed = u64::try_from(index + 1).unwrap_or(0);
@@ -779,9 +897,19 @@ impl StageExecutor {
     fn record_module(
         &self,
         assignment: &TaskAssignment,
-        report: ModuleReport,
+        mut report: ModuleReport,
         modules: &mut Vec<ModuleReport>,
     ) -> Result<(), StageFailure> {
+        // Adapters have no batch or task ids of their own; the executor binds
+        // every archive to the task that will persist it, so what the report
+        // records and what lands on disk carry the same identity.
+        if let Some(document) = report.archive.as_mut() {
+            let repository = document.repository.clone();
+            *document =
+                document
+                    .clone()
+                    .rebind(&assignment.batch_id, &assignment.task_id, repository);
+        }
         self.recorder
             .module(&assignment.task_id, &report)
             .map_err(|error| StageFailure {
@@ -795,23 +923,100 @@ impl StageExecutor {
     fn record_complete(
         &self,
         assignment: &TaskAssignment,
-        result: &VerificationResult,
+        completion: &TaskCompletion,
     ) -> Result<(), StageFailure> {
         self.recorder
-            .complete(&assignment.task_id, &self.owner, result)
+            .complete(&assignment.task_id, &self.owner, completion)
             .map_err(|error| StageFailure {
                 stage: ExecutionStage::Complete,
                 error,
             })
     }
 
-    fn cleanup(&self, task_id: &str, temp_root: &Path) {
-        match self.workspace.cleanup_temp(temp_root) {
-            Ok(()) => self.recorder.cleanup(task_id, temp_root, None),
-            Err(error) => self
-                .recorder
-                .cleanup(task_id, temp_root, Some(&error.to_string())),
+    /// Writes every module's archive document under the workspace, returning
+    /// the task's archive directory when at least one document was written.
+    fn persist_archives(&self, modules: &[ModuleReport]) -> Result<Option<String>, StageFailure> {
+        let mut archive_dir: Option<String> = None;
+        for report in modules {
+            let Some(document) = &report.archive else {
+                continue;
+            };
+            // `ArchiveDocument::new` sanitises every field, so what reaches the
+            // disk has already been through the redaction rules (CM-004).
+            //
+            // The report string is built from the (already safe-segmented) ids
+            // with forward slashes: it is a workspace-relative path shown in the
+            // report, not a filesystem operation, and a backslash would leak the
+            // platform's separator into a wire value.
+            let relative_dir = format!("archives/{}/{}", document.batch_id, document.task_id);
+            let file_name = document
+                .retention_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            let dir = self
+                .workspace
+                .child(&relative_dir)
+                .map_err(|error| StageFailure {
+                    stage: ExecutionStage::PlatformData,
+                    error: workspace_error(ExecutionStage::PlatformData, &error),
+                })?;
+            let contents = serde_json::to_vec_pretty(document).map_err(|error| StageFailure {
+                stage: ExecutionStage::PlatformData,
+                error: IpcError {
+                    code: "archive.serialize".to_owned(),
+                    category: ErrorCategory::Disk,
+                    retryable: false,
+                    stage: ExecutionStage::PlatformData.as_str().to_owned(),
+                    safe_message: format!("归档文档无法序列化：{error}"),
+                    action: "请重试该仓库；已推送的 Git 数据不受影响".to_owned(),
+                },
+            })?;
+            let Some(file_name) = file_name else {
+                return Err(StageFailure {
+                    stage: ExecutionStage::PlatformData,
+                    error: IpcError {
+                        code: "archive.path_encoding".to_owned(),
+                        category: ErrorCategory::Disk,
+                        retryable: false,
+                        stage: ExecutionStage::PlatformData.as_str().to_owned(),
+                        safe_message: "归档文件名包含无法写入的字符".to_owned(),
+                        action: "请把工作区改到只含 ASCII 字符的目录后重试".to_owned(),
+                    },
+                });
+            };
+            std::fs::write(dir.join(file_name), contents).map_err(|error| StageFailure {
+                stage: ExecutionStage::PlatformData,
+                error: IpcError {
+                    code: "archive.write".to_owned(),
+                    category: ErrorCategory::Disk,
+                    retryable: true,
+                    stage: ExecutionStage::PlatformData.as_str().to_owned(),
+                    safe_message: format!("归档文档写入失败：{error}"),
+                    action: "请确认工作区可写并有足够空间后重试该仓库".to_owned(),
+                },
+            })?;
+            archive_dir.get_or_insert(relative_dir);
         }
+        Ok(archive_dir)
+    }
+
+    /// Cleans (or, per policy, retains) the task's temporary directory and
+    /// records the outcome either way.
+    fn cleanup_after(&self, assignment: &TaskAssignment, temp_root: &Path, failed: bool) {
+        if failed && self.workspace_policy == WorkspacePolicy::Reuse {
+            // FR-011: the operator chose to keep failed mirrors; the report
+            // marks the retained path instead of silently deleting evidence.
+            self.recorder
+                .cleanup(&assignment.task_id, temp_root, TempDirOutcome::Retained);
+            return;
+        }
+        let outcome = match self.workspace.cleanup_temp(temp_root) {
+            Ok(()) => TempDirOutcome::Cleaned,
+            Err(error) => TempDirOutcome::Failed(error.to_string()),
+        };
+        self.recorder
+            .cleanup(&assignment.task_id, temp_root, outcome);
     }
 
     fn run_git(
@@ -868,6 +1073,66 @@ fn skipped_result() -> VerificationResult {
         fidelity: Vec::new(),
         evidence: VerificationEvidence::default(),
     }
+}
+
+/// Fields the source carried that the target cannot hold, across all modules.
+fn unmapped_fields(modules: &[ModuleReport]) -> Vec<String> {
+    let mut fields: Vec<String> = modules
+        .iter()
+        .flat_map(|report| report.unmapped_fields.iter().cloned())
+        .collect();
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+/// Counts LFS object files inside a mirror's LFS storage, i.e. the objects that
+/// were (or would have been) moved.
+fn count_lfs_objects(mirror: &Path) -> u64 {
+    fn visit(dir: &Path, count: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, count);
+            } else {
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0;
+    visit(&mirror.join("lfs").join("objects"), &mut count);
+    count
+}
+
+/// The remote `git lfs push` is pointed at. A local-path target (which
+/// `GenericGitUrl` deliberately accepts) has to become a `file://` URL: the
+/// standalone file transfer agent refuses a bare path with "no valid file://
+/// URLs found", even though every other Git command accepts it unchanged.
+fn lfs_remote_url(target_url: &str) -> String {
+    let path = Path::new(target_url);
+    if !path.is_absolute() {
+        return target_url.to_owned();
+    }
+    let mut url = String::from("file://");
+    for component in path.components() {
+        match component {
+            // `C:` keeps its colon and becomes `/C:`, which is what git-lfs
+            // expects on Windows; a Unix root contributes nothing extra.
+            std::path::Component::Prefix(prefix) => {
+                url.push('/');
+                url.push_str(&prefix.as_os_str().to_string_lossy());
+            }
+            std::path::Component::RootDir => {}
+            component => {
+                url.push('/');
+                url.push_str(&component.as_os_str().to_string_lossy());
+            }
+        }
+    }
+    url
 }
 
 fn terminal_status(error: &IpcError) -> AggregateStatus {

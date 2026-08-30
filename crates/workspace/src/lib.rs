@@ -96,6 +96,27 @@ impl Workspace {
             .as_nanos();
         self.child(&format!(".tmp-{id}-{stamp}"))
     }
+    /// Removes leftover temporary directories of an earlier attempt of `id`.
+    ///
+    /// Only directories whose name starts with this task's own prefix are
+    /// touched: the trailing `-` keeps `task-1` from matching `task-10`, and a
+    /// concurrent task owned by another worker is never affected.
+    pub fn purge_temp_for(&self, id: &str) -> Result<(), WorkspaceError> {
+        if id.is_empty() || id.contains("..") || id.contains('/') || id.contains('\\') {
+            return Err(WorkspaceError::OutsideRoot);
+        }
+        let prefix = format!(".tmp-{id}-");
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(&prefix) && entry.path().is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Debug)]
 pub struct WorkspaceLock {
@@ -161,5 +182,30 @@ mod tests {
             w.cleanup_temp(Path::new(".")),
             Err(WorkspaceError::OutsideRoot)
         ));
+    }
+    #[test]
+    fn purge_only_this_tasks_stale_directories() {
+        let d = tempfile::tempdir().unwrap();
+        let w = Workspace::new(d.path()).unwrap();
+        let stale = w.temp_dir("task-1").unwrap();
+        let other = w.temp_dir("task-10").unwrap();
+        let unrelated = w.temp_dir("task-2").unwrap();
+        std::fs::write(stale.join("mirror.git"), b"x").unwrap();
+
+        w.purge_temp_for("task-1").unwrap();
+        assert!(!stale.exists(), "the crashed attempt is removed");
+        assert!(other.exists(), "task-10 must not match task-1");
+        assert!(unrelated.exists(), "another task's dir is never touched");
+    }
+    #[test]
+    fn purge_rejects_ids_that_could_escape() {
+        let d = tempfile::tempdir().unwrap();
+        let w = Workspace::new(d.path()).unwrap();
+        for id in ["", "..", "a/b", "a\\b"] {
+            assert!(matches!(
+                w.purge_temp_for(id),
+                Err(WorkspaceError::OutsideRoot)
+            ));
+        }
     }
 }

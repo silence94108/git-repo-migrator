@@ -1,4 +1,11 @@
-pub mod archive;
+/// The archive document types live in `platform-core` so platform adapters can
+/// produce them directly; they are re-exported here because the executor and the
+/// fidelity contracts treat them as application-level vocabulary.
+pub mod archive {
+    pub use git_repo_migrator_platform_core::archive::{
+        ArchiveAttachment, ArchiveDocument, ArchiveItem, ARCHIVE_SCHEMA_VERSION,
+    };
+}
 pub mod executor;
 pub mod ipc_contract;
 pub mod orchestrator;
