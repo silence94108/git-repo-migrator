@@ -170,6 +170,13 @@ export function PreflightView({
               ? preview.ref_policy.excluded_refs.join(" · ")
               : "无（已选择归档到本地报告）"}
           </dd>
+          <dt>临时工作区</dt>
+          <dd>
+            {draft.workspacePolicy === "reuse"
+              ? "复用残留镜像（重试不重新克隆）"
+              : "重试前清理工作区（每次重新克隆）"}
+            <span className="step-note"> 可在「映射与策略」步骤调整。</span>
+          </dd>
         </dl>
       </section>
 

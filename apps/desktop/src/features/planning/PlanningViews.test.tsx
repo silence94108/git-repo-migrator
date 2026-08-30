@@ -6,6 +6,7 @@ import { PreflightView } from "./PreflightView";
 import { MigrationStore, useMigrationState } from "../../state/migrationStore";
 import {
   FakeBridge,
+  batch,
   connectedSnapshot,
   connection,
   ipcError,
@@ -154,6 +155,24 @@ describe("映射与策略页", () => {
     const archive = screen.getByLabelText(/把平台私有 refs 归档到本地报告/) as HTMLInputElement;
     expect(archive.checked).toBe(false);
     expect(screen.getByText(/仅本地归档，仍然不会推送到目标/)).toBeTruthy();
+  });
+
+  it("临时工作区策略默认复用镜像，可切换为重试前清理", async () => {
+    const store = await mountMapping(
+      new FakeBridge(snapshotWithRepos()),
+      items.map((item) => item.id),
+    );
+    const reuse = screen.getByLabelText(/复用残留镜像（默认）/ ) as HTMLInputElement;
+    const clean = screen.getByLabelText(/重试前清理工作区/) as HTMLInputElement;
+    expect(reuse.checked).toBe(true);
+    expect(clean.checked).toBe(false);
+    expect(store.getState().draft.workspacePolicy).toBe("reuse");
+
+    fireEvent.click(clean);
+    expect(store.getState().draft.workspacePolicy).toBe("clean");
+    expect((screen.getByLabelText(/复用残留镜像（默认）/) as HTMLInputElement).checked).toBe(
+      false,
+    );
   });
 
   it("非法目标名称阻止预检", async () => {
@@ -357,5 +376,37 @@ describe("预检页", () => {
     await mountPreflight(new FakeBridge(connectedSnapshot({ active_preview: preview() })));
     expect(screen.getByText(/refs\/heads\/\*:refs\/heads\/\*/)).toBeTruthy();
     expect(screen.getByText(/refs\/merge-requests\/\*/)).toBeTruthy();
+  });
+
+  it("摘要显示工作区策略，并把该策略原样传给 batch_start", async () => {
+    const bridge = new FakeBridge(connectedSnapshot({ active_preview: preview() }))
+      .on("plan_freeze", () => ({
+        plan_id: "plan-1",
+        plan_hash: "b".repeat(64),
+        status: "frozen",
+        repository_count: 1,
+        capability_snapshot_hash: "cap-hash",
+        dangerous_confirmed: false,
+        created_at_ms: 0,
+      }))
+      .on("batch_start", () => batch());
+    let started = false;
+    const store = await mountPreflight(bridge, () => {
+      started = true;
+    });
+
+    await act(async () => {
+      store.updateDraft({ workspacePolicy: "clean" });
+    });
+    expect(screen.getByText(/重试前清理工作区（每次重新克隆）/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /冻结计划并开始迁移/ }));
+    await waitFor(() => {
+      expect(started).toBe(true);
+    });
+    const sent = bridge.inputFor("batch_start") as {
+      input: { workspace_policy: string; concurrency: number };
+    };
+    expect(sent.input.workspace_policy).toBe("clean");
   });
 });

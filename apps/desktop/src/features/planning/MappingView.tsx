@@ -323,6 +323,45 @@ export function MappingView({
         </label>
       </section>
 
+      <section className="panel" aria-label="临时工作区策略">
+        <h2>临时工作区策略</h2>
+        <p className="caption">
+          迁移会在本地工作区克隆源仓库、推送后清理。这里选择中断后重试时如何处理上次留下的镜像。
+        </p>
+        <div role="radiogroup" aria-label="临时工作区策略">
+          <label className="radio-row" data-selected={draft.workspacePolicy === "reuse"}>
+            <input
+              type="radio"
+              name="workspace-policy"
+              value="reuse"
+              checked={draft.workspacePolicy === "reuse"}
+              onChange={() => store.updateDraft({ workspacePolicy: "reuse" })}
+            />
+            <span>
+              复用残留镜像（默认）
+              <span className="step-note">
+                上次中断留下的镜像会继续使用，节省重新克隆的时间和带宽。
+              </span>
+            </span>
+          </label>
+          <label className="radio-row" data-selected={draft.workspacePolicy === "clean"}>
+            <input
+              type="radio"
+              name="workspace-policy"
+              value="clean"
+              checked={draft.workspacePolicy === "clean"}
+              onChange={() => store.updateDraft({ workspacePolicy: "clean" })}
+            />
+            <span>
+              重试前清理工作区
+              <span className="step-note">
+                每次重试都删除残留镜像重新克隆。更慢，但排除残留数据引入的不一致。
+              </span>
+            </span>
+          </label>
+        </div>
+      </section>
+
       <section className="panel" aria-label="冲突策略">
         <h2>目标冲突策略</h2>
         <div role="radiogroup" aria-label="目标冲突策略">
