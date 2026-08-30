@@ -63,6 +63,8 @@
 - 2026-08-29 Wave 6 completed; Playwright harness, four E2E specs, Windows CI/release workflows and the release checklist added
 - 2026-08-29 Wave 6 evidence passed: rustfmt, strict clippy, 200 Rust tests, typecheck, 85 renderer tests, Vite production build, 23 browser E2E tests
 - 2026-08-29 Gate 1 passed; Gate 2 blocked on the items in Open Gaps
+- 2026-08-30 Open Gaps R-4..R-10 closed (see "Gap closure 2" below); Gate 2 remains blocked only on R-1/R-2/R-3 (packaged-app E2E run, physical Windows hardware run, first GitHub workflow run)
+- 2026-08-30 licensing decision recorded in docs/release-checklist.md §5: the installer bundles neither git.exe nor git-lfs.exe (missing Git fails with an actionable `git.missing`, missing git-lfs degrades the LFS module honestly), so GPLv2 source-offer obligations are not triggered
 
 ## Gap closure (2026-08-29)
 
@@ -81,6 +83,25 @@ Defects found and fixed while closing the gaps:
 - `Retry-After` was clamped down to the backoff ceiling, i.e. retried *earlier* than the server asked. It is now a floor, bounded by a separate 120 s cap.
 - `Orchestrator::retry` could not reopen a completed batch, unlike the SQLite queue it mirrors.
 
+## Gap closure 2 (2026-08-30)
+
+| # | Gap | What was built | Evidence |
+|---|---|---|---|
+| R-5 | Platform modules never ran a real API | `platform_gateway.rs` `ApiModuleGateway` drives the real adapters with source+target contexts inside the worker pool; issues/metadata migrate natively where the capability matrix says so, same-platform → native rebuild, cross-platform → archive | `cargo test --workspace` green; runner wiring exercised by desktop crate tests |
+| R-6 | Target creation not wired to an API | `ApiTargetGateway::create` calls the target platform adapter's `create_repository` (visibility Private, initialize false, idempotency = task id) whenever the target session has an adapter; generic/unknown targets keep the honest ls-remote probe + actionable refusal | desktop crate tests; `runner_tests.rs` |
+| R-7 | `connection_test` made no network call | `ApiConnectionTester` probes the real endpoint through the platform adapter with the stored credential; wrong token / unreachable instance / insufficient scope surface at test time | discovery tests |
+| R-8 | `workspace_policy` validated but never read | persisted on the batch row (migration 0002, schema v2), read back by the worker per batch and injected via `with_workspace_policy`; renderer exposes the radio group on the mapping page and shows the live value on the preflight summary | `flow_tests.rs` validation tests, `PlanningViews.test.tsx` (selection, summary, `batch_start` payload) |
+| R-9 | No LFS success-path test | real end-to-end test with git-lfs 3.7.1: fixture pushes one LFS object, executor runs `git-lfs fetch --all` + `push --all`, verification clone restores the original bytes | `tests/integration/generic_migration_flow.rs` `lfs_objects_travel_to_the_target_when_the_tool_is_present` |
+| R-10 | Archive/cleanup states were dead types | executor produces `ArchiveDocument`s and persists them under `archives/<batch>/<task>/`; `AppRecorder` records the real archive path, unmapped fields and retained-temp-directory outcomes | `generic_migration_flow.rs` archive assertions |
+| R-4 | Git / Git LFS licensing undecided | decision recorded in `docs/release-checklist.md` §5: bundle neither binary | checklist §5 filled |
+
+Defects found and fixed while closing the gaps:
+
+- `lfs_stage` passed a `lfs` subcommand prefix to the **git-lfs executable** (`run_lfs` invokes `git-lfs` directly, not `git lfs`) — every LFS push had been failing with exit 127. LFS push never worked before this fix.
+- Local absolute-path targets must be converted to `file://` URLs for git-lfs ("no valid file:// URLs found" otherwise).
+- `persist_archives` handed a full file path to `workspace.child()`; `create_dir_all` turned `issues.json` into a *directory* and the subsequent write failed with os error 5.
+- `ArchiveDocument` moved from `application` to `platform-core` so adapters can produce archive documents without depending on the application layer.
+
 ## Open Gaps (blocking Gate 2 / release)
 
 | # | Gap | Evidence | Impact |
@@ -88,10 +109,3 @@ Defects found and fixed while closing the gaps:
 | R-1 | The packaged-application E2E project has never been executed | `tests/e2e/windows-application.desktop.spec.ts` skips without `E2E_TAURI_BINARY`; no Tauri bundle has been built in this environment | The real backend + WebView2 path is unverified. The spec and the CI job exist but are unproven. |
 | R-2 | No Windows 10 / Windows 11 hardware run | `docs/release-checklist.md` §3 is empty | SSH, self-signed certificates, proxies and the credential-entry console window are untested on real machines |
 | R-3 | Neither workflow has run on GitHub | `.github/workflows/*.yml` added but never triggered | Signing, checksum and artifact steps are unverified; the `release` environment does not exist yet |
-| R-4 | Git / Git LFS distribution licensing undecided | `docs/release-checklist.md` §5 unchecked | If the installer ever bundles `git.exe`, GPLv2 source-offer obligations apply |
-| R-5 | Platform modules do not execute against a real API | `StageExecutor` `ModuleGateway` defaults to `NoPlatformApi`; only discovery is wired to the adapters | Issues/PR/Wiki/Release migration reports `unsupported` rather than migrating. Honest, but not the PRD's full scope. |
-| R-6 | Target creation is not wired to a platform API | `runner::GitTargetGateway::create` returns an actionable refusal | An operator must pre-create an empty target repository; `create` plan rows fail with a next step instead of migrating |
-| R-7 | `connection_test` performs no network call at all | `AppState::test_connection` returns a static capability table keyed on `platform_hint`; `authenticated` is just `credential_ref.is_some()` | The "test connection" button cannot surface a wrong token, an unreachable instance or an insufficient scope — those only appear once a batch runs |
-| R-8 | `workspace_policy` is validated and then never read | `start_batch` accepts `reuse`/`clean`; no other reader exists | Choosing "clean workspace" cleans nothing |
-| R-9 | The LFS success path has no test coverage | Only the "git-lfs missing → degrade" branch is tested; no test ever constructs `with_lfs(true)`, although git-lfs 3.7.1 is installed here | The `git lfs fetch --all` / `push --all` arguments and their failure mapping are unverified |
-| R-10 | Archive and cleanup states are dead types | The executor never produces an `ArchiveDocument`; `AppRecorder` hard-codes `archive_path: None` and an empty `unmapped_fields`; nothing produces `CleanupState::RetainedTempDirectory` | The report's archive path, unmapped fields and retained-temp-directory states can never be populated |
