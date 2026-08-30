@@ -65,6 +65,8 @@
 - 2026-08-29 Gate 1 passed; Gate 2 blocked on the items in Open Gaps
 - 2026-08-30 Open Gaps R-4..R-10 closed (see "Gap closure 2" below); Gate 2 remains blocked only on R-1/R-2/R-3 (packaged-app E2E run, physical Windows hardware run, first GitHub workflow run)
 - 2026-08-30 licensing decision recorded in docs/release-checklist.md §5: the installer bundles neither git.exe nor git-lfs.exe (missing Git fails with an actionable `git.missing`, missing git-lfs degrades the LFS module honestly), so GPLv2 source-offer obligations are not triggered
+- 2026-08-30 R-1 closed: the packaged application was built (`tauri build --no-bundle --config src-tauri/tauri.e2e.conf.json`, which adds the WebView2 debugging port) and the desktop E2E project ran for the first time — 4/4 passed on this Windows 11 machine (startup + snapshot, renderer capability surface, command whitelist rejection, SQLite persistence across restart)
+- 2026-08-30 P0 defect found by that first run and fixed: the production IPC bridge double-wrapped every payload (`{ input: { input: {...} } }`), so **every** payload-carrying command in the packaged app failed against the commands' `deny_unknown_fields` structs while the whole jsdom suite stayed green (the in-memory test double never exercised the wrapping). Guard test added (`ipcClient.test.ts`); the E2E spec also gained real user-data-folder isolation (`WEBVIEW2_USER_DATA_FOLDER`) and serial execution (one CDP port), and the CI workflow's desktop job was corrected (missing `e2e:desktop` script, wrong binary path, missing E2E window config)
 
 ## Gap closure (2026-08-29)
 
@@ -106,6 +108,5 @@ Defects found and fixed while closing the gaps:
 
 | # | Gap | Evidence | Impact |
 |---|---|---|---|
-| R-1 | The packaged-application E2E project has never been executed | `tests/e2e/windows-application.desktop.spec.ts` skips without `E2E_TAURI_BINARY`; no Tauri bundle has been built in this environment | The real backend + WebView2 path is unverified. The spec and the CI job exist but are unproven. |
 | R-2 | No Windows 10 / Windows 11 hardware run | `docs/release-checklist.md` §3 is empty | SSH, self-signed certificates, proxies and the credential-entry console window are untested on real machines |
 | R-3 | Neither workflow has run on GitHub | `.github/workflows/*.yml` added but never triggered | Signing, checksum and artifact steps are unverified; the `release` environment does not exist yet |
