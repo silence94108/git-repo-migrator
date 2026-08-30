@@ -26,6 +26,7 @@ use git_repo_migrator_git_runner::{
     discover_refs, push_allowlisted_refs, verify_refs, GitError, GitExecutable, GitRunner,
     RefEntry, RunOptions,
 };
+use git_repo_migrator_platform_core::git_credentials::{askpass_env, RemoteCredential};
 use git_repo_migrator_workspace::{Workspace, WorkspaceError};
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +155,56 @@ impl WorkspacePolicy {
             _ => None,
         }
     }
+}
+
+/// Which remote a Git invocation is about to talk to. Credentials never cross
+/// sides: the source token cannot authenticate the push, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSide {
+    Source,
+    Target,
+}
+
+/// Whether a remote URL authenticates over HTTP — the only transport the
+/// askpass bridge covers. Local paths and SSH are out of scope here.
+fn requires_http_auth(url: &str) -> bool {
+    let lowered = url.trim().to_ascii_lowercase();
+    lowered.starts_with("http://") || lowered.starts_with("https://")
+}
+
+/// Builds the askpass environment for one remote, or `None` when the remote
+/// cannot (local path) or need not (no credential bound) authenticate.
+///
+/// The values are ids and names, never secrets: the askpass program reads the
+/// token from the credential store itself, so a process listing or a Git error
+/// message cannot leak it.
+fn auth_env_for(
+    credential: Option<&RemoteCredential>,
+    askpass: Option<&Path>,
+    url: &str,
+) -> Option<BTreeMap<String, String>> {
+    if !requires_http_auth(url) {
+        return None;
+    }
+    let credential = credential?;
+    let program = askpass?;
+    Some(askpass_env(program, credential))
+}
+
+/// The honest failure for "this remote needs authentication, and the program
+/// that answers prompts is not there".
+fn askpass_missing(stage: ExecutionStage) -> Result<(), StageFailure> {
+    Err(StageFailure {
+        stage,
+        error: IpcError {
+            code: "git.askpass_missing".to_owned(),
+            category: ErrorCategory::Validation,
+            retryable: false,
+            stage: stage.as_str().to_owned(),
+            safe_message: "该远程需要认证，但找不到凭据应答程序".to_owned(),
+            action: "请重新安装应用（凭据应答程序与应用位于同一目录），然后重试该仓库".to_owned(),
+        },
+    })
 }
 
 /// One platform module's outcome, as the executor observed it.
@@ -320,6 +371,13 @@ pub struct StageExecutor {
     min_free_bytes: u64,
     lfs_available: bool,
     workspace_policy: WorkspacePolicy,
+    /// Non-secret Git authentication for the source remote, if it needs any.
+    /// See [`git_credentials`] for what crosses the process boundary.
+    source_credentials: Option<RemoteCredential>,
+    /// Non-secret Git authentication for the target remote.
+    target_credentials: Option<RemoteCredential>,
+    /// The program Git should call instead of opening a terminal prompt.
+    askpass_program: Option<PathBuf>,
 }
 
 impl StageExecutor {
@@ -341,6 +399,9 @@ impl StageExecutor {
             min_free_bytes: DEFAULT_MIN_FREE_BYTES,
             lfs_available: false,
             workspace_policy: WorkspacePolicy::Reuse,
+            source_credentials: None,
+            target_credentials: None,
+            askpass_program: None,
         }
     }
 
@@ -379,6 +440,30 @@ impl StageExecutor {
     /// Sets what happens to the workspace across attempts (FR-011).
     pub fn with_workspace_policy(mut self, policy: WorkspacePolicy) -> Self {
         self.workspace_policy = policy;
+        self
+    }
+
+    /// Declares the Git-level credentials for the source and target remotes.
+    ///
+    /// Neither value contains a secret; they name a credential-store reference
+    /// and the basic-auth username. They are only applied to `http(s)` remotes —
+    /// SSH and local paths authenticate some other way.
+    pub fn with_git_credentials(
+        mut self,
+        source: Option<RemoteCredential>,
+        target: Option<RemoteCredential>,
+    ) -> Self {
+        self.source_credentials = source;
+        self.target_credentials = target;
+        self
+    }
+
+    /// Points Git's askpass hook at a program that resolves the credentials.
+    ///
+    /// Without it, a remote that needs authentication cannot be answered and the
+    /// run must fail honestly rather than fall back to an interactive prompt.
+    pub fn with_askpass_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.askpass_program = Some(program.into());
         self
     }
 
@@ -606,6 +691,11 @@ impl StageExecutor {
         let stage = ExecutionStage::Git;
         self.guard(assignment, stage)?;
         self.begin(assignment, stage)?;
+        // Both remotes must be able to authenticate before anything runs: a
+        // clone that dies halfway on a missing askpass program wastes the
+        // whole mirror download.
+        self.require_askpass(CredentialSide::Source, &assignment.source_url, stage)?;
+        self.require_askpass(CredentialSide::Target, &assignment.target_url, stage)?;
 
         // A mirror clone is a complete *read*. It never implies that every ref
         // is pushed: the push refspecs below are built from the ref policy.
@@ -619,6 +709,8 @@ impl StageExecutor {
             ],
             None,
             stage,
+            self.auth_env(CredentialSide::Source, &assignment.source_url)
+                .as_ref(),
         )?;
         self.report(assignment, stage, 1, Some(3))?;
 
@@ -637,6 +729,9 @@ impl StageExecutor {
             &assignment.target_url,
             &source_refs,
             &assignment.ref_policy,
+            &self
+                .auth_env(CredentialSide::Target, &assignment.target_url)
+                .unwrap_or_default(),
         )
         .map_err(|error| StageFailure {
             stage,
@@ -670,8 +765,15 @@ impl StageExecutor {
 
         // The commands run the `git-lfs` executable directly (`run_lfs`), so
         // they carry no `lfs` prefix — that prefix belongs to `git lfs`, and
-        // `git-lfs lfs fetch` is an unknown command.
-        let fetch = self.run_lfs(&["fetch".to_owned(), "--all".to_owned()], Some(mirror));
+        // `git-lfs lfs fetch` is an unknown command. Fetch reads the source
+        // remote; push writes the target, so each gets its own credential.
+        let source_auth = self.auth_env(CredentialSide::Source, &assignment.source_url);
+        let fetch = self.run_lfs(
+            &["fetch".to_owned(), "--all".to_owned()],
+            Some(mirror),
+            source_auth.as_ref(),
+        );
+        let target_auth = self.auth_env(CredentialSide::Target, &assignment.target_url);
         let push = fetch.and_then(|_| {
             self.run_lfs(
                 &[
@@ -680,6 +782,7 @@ impl StageExecutor {
                     lfs_remote_url(&assignment.target_url),
                 ],
                 Some(mirror),
+                target_auth.as_ref(),
             )
         });
         let report = match push {
@@ -792,6 +895,9 @@ impl StageExecutor {
         self.guard(assignment, stage)?;
         self.begin(assignment, stage)?;
 
+        // The verification reads the target back, so it needs the target's
+        // credential to see past the private-repository wall.
+        self.require_askpass(CredentialSide::Target, &assignment.target_url, stage)?;
         let output = self.run_git(
             &[
                 "ls-remote".to_owned(),
@@ -800,6 +906,8 @@ impl StageExecutor {
             ],
             None,
             stage,
+            self.auth_env(CredentialSide::Target, &assignment.target_url)
+                .as_ref(),
         )?;
         let target_refs = parse_ls_remote(&output);
         let verification = verify_refs(source_refs, &target_refs);
@@ -1024,9 +1132,10 @@ impl StageExecutor {
         args: &[String],
         current_dir: Option<&Path>,
         stage: ExecutionStage,
+        auth: Option<&BTreeMap<String, String>>,
     ) -> Result<String, StageFailure> {
         self.git
-            .run(args, self.options(current_dir))
+            .run(args, self.options(current_dir, auth))
             .map(|output| output.stdout)
             .map_err(|error| StageFailure {
                 stage,
@@ -1034,23 +1143,70 @@ impl StageExecutor {
             })
     }
 
-    fn run_lfs(&self, args: &[String], current_dir: Option<&Path>) -> Result<String, GitError> {
+    fn run_lfs(
+        &self,
+        args: &[String],
+        current_dir: Option<&Path>,
+        auth: Option<&BTreeMap<String, String>>,
+    ) -> Result<String, GitError> {
         self.git
-            .run_executable(GitExecutable::GitLfs, args, self.options(current_dir))
+            .run_executable(GitExecutable::GitLfs, args, self.options(current_dir, auth))
             .map(|output| output.stdout)
     }
 
-    fn options(&self, current_dir: Option<&Path>) -> RunOptions {
+    fn options(
+        &self,
+        current_dir: Option<&Path>,
+        auth: Option<&BTreeMap<String, String>>,
+    ) -> RunOptions {
         let mut env = BTreeMap::new();
         // A GUI child process must never open an interactive credential prompt;
         // an unauthenticated call has to fail fast and become a visible error.
         env.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
+        // The askpass contract: nothing secret crosses here, only where to find
+        // the credential and which username to present. The token itself is
+        // resolved by the askpass program and travels over its stdout pipe.
+        if let Some(auth) = auth {
+            env.extend(auth.clone());
+        }
         RunOptions {
             timeout: self.timeout,
             cancel: Some(Arc::clone(&self.cancel)),
             current_dir: current_dir.map(Path::to_path_buf),
             env,
         }
+    }
+
+    /// The environment that lets Git authenticate one side's HTTP remote.
+    ///
+    /// `None` when the side needs no authentication (local path, SSH, or no
+    /// credential bound) — in that case Git runs exactly as before.
+    fn auth_env(&self, side: CredentialSide, url: &str) -> Option<BTreeMap<String, String>> {
+        let credential = match side {
+            CredentialSide::Source => self.source_credentials.as_ref(),
+            CredentialSide::Target => self.target_credentials.as_ref(),
+        };
+        auth_env_for(credential, self.askpass_program.as_deref(), url)
+    }
+
+    /// An HTTP remote with a bound credential can only authenticate through the
+    /// askpass bridge. Without the program the clone would fail as a bare 401,
+    /// which says nothing about what the operator can actually fix — so the run
+    /// stops before Git starts, with the real reason.
+    fn require_askpass(
+        &self,
+        side: CredentialSide,
+        url: &str,
+        stage: ExecutionStage,
+    ) -> Result<(), StageFailure> {
+        let bound = match side {
+            CredentialSide::Source => self.source_credentials.is_some(),
+            CredentialSide::Target => self.target_credentials.is_some(),
+        };
+        if !bound || !requires_http_auth(url) || self.askpass_program.is_some() {
+            return Ok(());
+        }
+        askpass_missing(stage)
     }
 }
 
@@ -1577,5 +1733,80 @@ mod tests {
             assignment.selected_platform_modules(),
             ["issues", "releases"]
         );
+    }
+
+    fn gitea_credential() -> RemoteCredential {
+        RemoteCredential {
+            credential_ref: "credential/windows/0123abcd".to_owned(),
+            username: "git".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_http_remote_with_a_credential_gets_the_askpass_environment() {
+        let env = auth_env_for(
+            Some(&gitea_credential()),
+            Some(Path::new(r"C:\Apps\Git Repo Migrator\app.exe")),
+            "http://git.example.com/owner/repo.git",
+        )
+        .expect("http + credential + program ⇒ askpass environment");
+        assert_eq!(
+            env.get(git_repo_migrator_platform_core::git_credentials::ENV_ASKPASS_PROGRAM)
+                .map(String::as_str),
+            Some(r"C:\Apps\Git Repo Migrator\app.exe"),
+            "a path with spaces must survive verbatim"
+        );
+        assert_eq!(
+            env.get(git_repo_migrator_platform_core::git_credentials::ENV_CREDENTIAL_REF)
+                .map(String::as_str),
+            Some("credential/windows/0123abcd")
+        );
+        assert_eq!(
+            env.get(git_repo_migrator_platform_core::git_credentials::ENV_USERNAME)
+                .map(String::as_str),
+            Some("git")
+        );
+        // The contract is three variables; a fourth would be scope creep and a
+        // place for a secret to hide.
+        assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn nothing_is_injected_without_all_three_preconditions() {
+        let program = Some(Path::new("app.exe"));
+        let credential = gitea_credential();
+        // Local paths never authenticate over HTTP.
+        assert!(auth_env_for(Some(&credential), program, r"C:\mirror").is_none());
+        assert!(auth_env_for(Some(&credential), program, "ssh://git@host/r.git").is_none());
+        // A remote without a bound credential runs exactly as before.
+        assert!(auth_env_for(None, program, "https://git.example.com/r.git").is_none());
+        // A credential without the askpass program cannot be delivered.
+        assert!(auth_env_for(Some(&credential), None, "https://git.example.com/r.git").is_none());
+    }
+
+    #[test]
+    fn https_urls_are_matched_case_insensitively_at_the_start() {
+        let credential = gitea_credential();
+        assert!(auth_env_for(
+            Some(&credential),
+            Some(Path::new("app.exe")),
+            "HTTPS://git.example.com/r.git"
+        )
+        .is_some());
+        // "http" inside a path segment is not a scheme.
+        assert!(auth_env_for(
+            Some(&credential),
+            Some(Path::new("app.exe")),
+            "C:\\http-looks-like-a-scheme"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_missing_askpass_program_fails_the_stage_with_an_actionable_error() {
+        let failure = askpass_missing(ExecutionStage::Git).expect_err("bridge missing");
+        assert_eq!(failure.error.code, "git.askpass_missing");
+        assert!(!failure.error.retryable);
+        assert!(failure.error.action.contains("重新安装"));
     }
 }

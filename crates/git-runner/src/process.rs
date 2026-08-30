@@ -9,6 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// Windows process-creation flag (winbase.h `CREATE_NO_WINDOW`): the child
+/// runs without a console window. `std` does not export the constant.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitExecutable {
     Git,
@@ -156,6 +164,12 @@ impl GitRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The GUI process has no console, so Windows would otherwise flash a
+        // new console window for every Git invocation — one per clone, push and
+        // probe. CREATE_NO_WINDOW keeps the child invisible while its pipes
+        // stay fully functional.
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
         if let Some(dir) = options.current_dir {
             cmd.current_dir(dir);
         }

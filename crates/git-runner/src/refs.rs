@@ -53,12 +53,18 @@ pub fn build_allowlisted_refspecs(entries: &[RefEntry], _policy: &RefPolicy) -> 
         .collect()
 }
 
+/// Pushes the allowlisted refs to the target.
+///
+/// `auth` carries non-secret environment values (an askpass program and a
+/// credential *reference*) that let Git authenticate an HTTP target without the
+/// token ever entering argv. Local targets pass an empty map.
 pub fn push_allowlisted_refs(
     runner: &GitRunner,
     repo: &std::path::Path,
     target_url: &str,
     entries: &[RefEntry],
     policy: &RefPolicy,
+    auth: &std::collections::BTreeMap<String, String>,
 ) -> Result<crate::GitOutput, GitError> {
     if target_url.contains('@') {
         return Err(GitError::InvalidArgument(
@@ -71,12 +77,18 @@ pub fn push_allowlisted_refs(
             "no allowlisted refs to push".into(),
         ));
     }
+    let mut env = std::collections::BTreeMap::new();
+    // A GUI child process must never open an interactive credential prompt;
+    // an unauthenticated push has to fail fast and become a visible error.
+    env.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
+    env.extend(auth.clone());
     let mut args = vec!["push".into(), target_url.into()];
     args.extend(specs);
     runner.run(
         &args,
         RunOptions {
             current_dir: Some(repo.to_path_buf()),
+            env,
             ..Default::default()
         },
     )

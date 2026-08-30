@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod git_credentials;
 pub mod transport;
 
 use async_trait::async_trait;

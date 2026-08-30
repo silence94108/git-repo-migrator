@@ -78,12 +78,14 @@ fn migrates_heads_and_tags_without_private_refs() {
             && entry.decision == RefPolicyDecision::Ignore
     }));
 
+    // Local file targets carry no credentials, so the auth map is empty.
     push_allowlisted_refs(
         &runner,
         &source,
         target.to_str().unwrap(),
         &source_refs,
         &policy,
+        &BTreeMap::new(),
     )
     .unwrap();
     let target_refs = discover_refs(&runner, &target, &policy).unwrap();
