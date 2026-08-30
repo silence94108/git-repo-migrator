@@ -74,6 +74,10 @@ fn backoff(config: &HttpTransportConfig, attempt: u32, retry_after: Option<Durat
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthScheme {
     Bearer,
+    /// Gitea/Forgejo's documented scheme for personal access tokens. Modern
+    /// instances also accept `Bearer`, but older Gitea parses only `token`, and
+    /// Gitea's own API docs still specify `token` — so that is what we send.
+    GiteaToken,
     GitlabPrivateToken,
     None,
 }
@@ -81,10 +85,8 @@ enum AuthScheme {
 fn scheme_for(kind: PlatformKind) -> AuthScheme {
     match kind {
         PlatformKind::Gitlab => AuthScheme::GitlabPrivateToken,
-        PlatformKind::Github
-        | PlatformKind::Gitea
-        | PlatformKind::Forgejo
-        | PlatformKind::Gitee => AuthScheme::Bearer,
+        PlatformKind::Gitea | PlatformKind::Forgejo => AuthScheme::GiteaToken,
+        PlatformKind::Github | PlatformKind::Gitee => AuthScheme::Bearer,
         // Generic Git has no API, so an API token would have nowhere to go.
         PlatformKind::GenericGit | PlatformKind::Unknown => AuthScheme::None,
     }
@@ -200,6 +202,7 @@ impl ReqwestTransport {
             .map_err(|_| TransportError::InvalidConfig("凭据不是 UTF-8 文本".into()))?;
         let (name, value) = match self.scheme {
             AuthScheme::Bearer => ("Authorization", format!("Bearer {secret}")),
+            AuthScheme::GiteaToken => ("Authorization", format!("token {secret}")),
             AuthScheme::GitlabPrivateToken => ("PRIVATE-TOKEN", secret.to_owned()),
             AuthScheme::None => unreachable!("checked above"),
         };
@@ -335,22 +338,44 @@ mod tests {
     }
 
     #[test]
-    fn only_gitlab_uses_a_private_token_header() {
+    fn each_platform_gets_its_documented_authorisation_scheme() {
         assert_eq!(
             scheme_for(PlatformKind::Gitlab),
             AuthScheme::GitlabPrivateToken
         );
-        for kind in [
-            PlatformKind::Github,
-            PlatformKind::Gitea,
-            PlatformKind::Forgejo,
-            PlatformKind::Gitee,
-        ] {
+        for kind in [PlatformKind::Gitea, PlatformKind::Forgejo] {
+            assert_eq!(scheme_for(kind), AuthScheme::GiteaToken);
+        }
+        for kind in [PlatformKind::Github, PlatformKind::Gitee] {
             assert_eq!(scheme_for(kind), AuthScheme::Bearer);
         }
         for kind in [PlatformKind::GenericGit, PlatformKind::Unknown] {
             assert_eq!(scheme_for(kind), AuthScheme::None);
         }
+    }
+
+    #[test]
+    fn gitea_tokens_carry_the_documented_token_prefix() {
+        let store = Arc::new(CredentialStore::in_memory());
+        let reference = store.put("gitea", b"secret-token").expect("stored");
+        let transport =
+            ReqwestTransport::new(config(), PlatformKind::Gitea, store).expect("transport");
+
+        let wire = transport
+            .build(&HttpRequest {
+                method: "GET".into(),
+                url: "http://gitea.local/api/v1/version".into(),
+                headers: vec![("X-Credential-Ref".into(), reference.as_str().into())],
+                body: None,
+            })
+            .expect("request built");
+
+        assert_eq!(
+            wire.headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("token secret-token")
+        );
     }
 
     #[test]
