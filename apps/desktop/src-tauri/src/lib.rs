@@ -77,6 +77,15 @@ fn build_state<R: tauri::Runtime>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Git (and git-lfs) call this binary with `--askpass <prompt>` whenever an
+    // HTTP remote wants a username or password. That must be answered before
+    // anything GUI-related starts — no window, no Tauri runtime, just one line
+    // on stdout for Git to read. The token leaves Windows Credential Manager
+    // only here, on a pipe to Git.
+    if let Some(prompt) = askpass_prompt(std::env::args().skip(1)) {
+        std::process::exit(run_askpass(&prompt));
+    }
+
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
@@ -117,4 +126,67 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Git Repo Migrator");
+}
+
+/// Recognises the `--askpass <prompt>` invocation Git uses.
+///
+/// Returns `None` for every other invocation, including the plain GUI start.
+fn askpass_prompt<I: Iterator<Item = String>>(args: I) -> Option<String> {
+    let mut args = args;
+    if args.next().as_deref() != Some(ASKPASS_ARG) {
+        return None;
+    }
+    args.next()
+}
+
+/// The argv flag Git calls the askpass program with.
+const ASKPASS_ARG: &str = "--askpass";
+
+/// Answers one askpass prompt and reports the process exit code.
+fn run_askpass(prompt: &str) -> i32 {
+    use git_repo_migrator_credential_store::askpass::answer_from_environment;
+
+    let store = git_repo_migrator_credential_store::CredentialStore::new();
+    let env = |key: &str| std::env::var(key).ok();
+    match answer_from_environment(prompt, &env, &store) {
+        Ok(answer) => {
+            // One line to stdout — the pipe Git is holding open. Git itself
+            // strips the trailing newline.
+            println!("{answer}");
+            0
+        }
+        Err(error) => {
+            eprintln!("askpass failed: {}", error.safe_message);
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_askpass_invocation_is_recognised() {
+        assert_eq!(
+            askpass_prompt(
+                ["--askpass", "Password for 'http://x': "]
+                    .into_iter()
+                    .map(String::from)
+            ),
+            Some("Password for 'http://x': ".to_owned())
+        );
+        // The GUI start, and anything else, must fall through untouched.
+        assert_eq!(askpass_prompt(std::iter::empty()), None);
+        assert_eq!(
+            askpass_prompt(["--flag"].into_iter().map(String::from)),
+            None
+        );
+        // A missing prompt is not answerable; Git treats a failure as "no
+        // credentials" and the migration surfaces a real auth error.
+        assert_eq!(
+            askpass_prompt(["--askpass"].into_iter().map(String::from)),
+            None
+        );
+    }
 }

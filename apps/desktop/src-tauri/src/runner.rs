@@ -23,6 +23,7 @@ use git_repo_migrator_application::verification::AggregateStatus;
 use git_repo_migrator_application::{BatchControl, IpcError};
 use git_repo_migrator_domain::ErrorCategory;
 use git_repo_migrator_git_runner::{GitExecutable, GitRunner, RunOptions};
+use git_repo_migrator_platform_core::git_credentials::{self, RemoteCredential};
 use git_repo_migrator_workspace::Workspace;
 
 use crate::dto::{CleanupState, MigrationStage};
@@ -313,6 +314,9 @@ impl BatchLauncher for ThreadPoolLauncher {
 struct GitTargetGateway {
     probe: crate::ports::GitLsRemoteProbe,
     session: Option<crate::platform_gateway::PlatformSession>,
+    /// The target connection's Git credential, for the `ls-remote` path only —
+    /// an API platform authenticates through its adapter instead.
+    target_credential: Option<RemoteCredential>,
 }
 
 impl TargetGateway for GitTargetGateway {
@@ -340,7 +344,15 @@ impl TargetGateway for GitTargetGateway {
                 Err(_) => Ok(TargetState::Unknown),
             };
         }
-        crate::ports::TargetProbe::probe(&self.probe, target_url)
+        // A Generic target is probed with `ls-remote`, which has to see past
+        // the same authentication wall the push will meet.
+        let askpass = std::env::current_exe().ok();
+        crate::ports::TargetProbe::probe_authenticated(
+            &self.probe,
+            target_url,
+            self.target_credential.as_ref(),
+            askpass.as_deref(),
+        )
     }
 
     fn create(&self, assignment: &TaskAssignment) -> Result<(), IpcError> {
@@ -476,17 +488,30 @@ impl Worker {
             Arc::clone(&self.events),
             self.batch_id.clone(),
         ));
+        let connections = self.state.connections().unwrap_or_default();
+        // Git transport credentials: the askpass bridge answers Git's HTTP auth
+        // prompts out of Windows Credential Manager, so a private instance —
+        // where even a clone needs a token — works end to end. The values here
+        // are ids, never tokens.
         let mut executor = StageExecutor::new(git, workspace, recorder, self.owner.clone())
             .with_cancel(Arc::clone(&self.cancel))
             .with_lfs(lfs_available)
-            .with_workspace_policy(self.state.workspace_policy_of(&self.batch_id));
+            .with_workspace_policy(self.state.workspace_policy_of(&self.batch_id))
+            .with_git_credentials(
+                git_credential_for(&connections, crate::dto::ConnectionRole::Source),
+                git_credential_for(&connections, crate::dto::ConnectionRole::Target),
+            );
+        // The application binary doubles as the askpass program: Git calls it
+        // with `--askpass`, which `run()` dispatches before any GUI starts.
+        if let Ok(program) = std::env::current_exe() {
+            executor = executor.with_askpass_program(program);
+        }
 
         // Platform sessions come from the persisted connection rows. A source
         // without a connection means the operator imported URLs by hand: the
         // generic session still archives read-only modules. A target without a
         // connection keeps `None`, which leaves `ls-remote` probing and the honest
         // "no repository-creation API" refusal.
-        let connections = self.state.connections().unwrap_or_default();
         let source_session = connections
             .iter()
             .find(|connection| connection.role == crate::dto::ConnectionRole::Source)
@@ -534,10 +559,38 @@ impl Worker {
             executor = executor.with_target_gateway(Arc::new(GitTargetGateway {
                 probe,
                 session: target_session,
+                target_credential: git_credential_for(
+                    &connections,
+                    crate::dto::ConnectionRole::Target,
+                ),
             }));
         }
         Ok(executor)
     }
+}
+
+/// The Git-level credential for one side's saved connection, if it has one.
+///
+/// Only ids and names cross here. The askpass program reads the token from the
+/// credential store when Git actually asks for it.
+fn git_credential_for(
+    connections: &[crate::dto::ConnectionSnapshot],
+    role: crate::dto::ConnectionRole,
+) -> Option<RemoteCredential> {
+    let connection = connections
+        .iter()
+        .find(|connection| connection.role == role)?;
+    let credential_ref = connection.credential_ref.as_deref()?.trim();
+    if credential_ref.is_empty() {
+        return None;
+    }
+    Some(RemoteCredential {
+        credential_ref: credential_ref.to_owned(),
+        username: git_credentials::basic_auth_username(
+            connection.platform,
+            connection.account_name.as_deref(),
+        ),
+    })
 }
 
 fn lfs_executable() -> &'static str {
@@ -602,5 +655,84 @@ mod tests {
             status_text(AggregateStatus::RetryableFailed),
             "retryable_failed"
         );
+    }
+
+    fn connection(
+        role: crate::dto::ConnectionRole,
+        platform: git_repo_migrator_platform_core::PlatformKind,
+        credential_ref: Option<&str>,
+        account_name: Option<&str>,
+    ) -> crate::dto::ConnectionSnapshot {
+        crate::dto::ConnectionSnapshot {
+            id: format!("{role:?}"),
+            role,
+            platform,
+            endpoint: "https://git.example.com".to_owned(),
+            credential_ref: credential_ref.map(str::to_owned),
+            authenticated: credential_ref.is_some(),
+            account_name: account_name.map(str::to_owned),
+            instance_version: None,
+            tls_trusted: true,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_connection_with_a_credential_becomes_a_git_credential() {
+        let connections = vec![connection(
+            crate::dto::ConnectionRole::Source,
+            git_repo_migrator_platform_core::PlatformKind::Gitea,
+            Some("credential/windows/0123abcd"),
+            Some("ops-bot"),
+        )];
+        let credential =
+            git_credential_for(&connections, crate::dto::ConnectionRole::Source).expect("bound");
+        assert_eq!(credential.credential_ref, "credential/windows/0123abcd");
+        assert_eq!(credential.username, "ops-bot");
+        // The other side is not answered from this connection.
+        assert!(git_credential_for(&connections, crate::dto::ConnectionRole::Target).is_none());
+    }
+
+    #[test]
+    fn gitlab_demands_oauth2_and_anonymous_connections_stay_anonymous() {
+        // GitLab HTTP auth only accepts the literal `oauth2` user; the account
+        // name must not be substituted for it.
+        let gitlab = connection(
+            crate::dto::ConnectionRole::Target,
+            git_repo_migrator_platform_core::PlatformKind::Gitlab,
+            Some("credential/windows/5678efab"),
+            Some("ops-bot"),
+        );
+        let credential =
+            git_credential_for(&[gitlab], crate::dto::ConnectionRole::Target).expect("bound");
+        assert_eq!(credential.username, "oauth2");
+
+        // Without an account name the username is a placeholder — the token in
+        // the password field is what authenticates.
+        let gitea = connection(
+            crate::dto::ConnectionRole::Target,
+            git_repo_migrator_platform_core::PlatformKind::Gitea,
+            Some("credential/windows/5678efab"),
+            None,
+        );
+        let credential =
+            git_credential_for(&[gitea], crate::dto::ConnectionRole::Target).expect("bound");
+        assert_eq!(credential.username, "git");
+
+        // An empty reference means "no credential", not "credential of nothing".
+        let anonymous = connection(
+            crate::dto::ConnectionRole::Target,
+            git_repo_migrator_platform_core::PlatformKind::Gitea,
+            Some("   "),
+            None,
+        );
+        assert!(git_credential_for(&[anonymous], crate::dto::ConnectionRole::Target).is_none());
+        let missing = connection(
+            crate::dto::ConnectionRole::Target,
+            git_repo_migrator_platform_core::PlatformKind::Gitea,
+            None,
+            None,
+        );
+        assert!(git_credential_for(&[missing], crate::dto::ConnectionRole::Target).is_none());
     }
 }

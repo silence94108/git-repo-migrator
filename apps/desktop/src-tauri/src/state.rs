@@ -29,6 +29,7 @@ use git_repo_migrator_domain::{
     RepoTaskState, RepositoryMapping,
 };
 use git_repo_migrator_local_store::{AppendCheckpoint, LocalStore, StoreResult};
+use git_repo_migrator_platform_core::git_credentials::{self, RemoteCredential};
 use git_repo_migrator_platform_core::{DiscoveryQuery, PlatformKind, RepositoryVisibility};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -504,7 +505,17 @@ impl AppState {
                 "请在设置中启用系统 Git，或手动确认目标后重新预检",
             )
         })?;
-        let state = probe.probe(&target_url)?;
+        // A saved target connection with a credential probes through the same
+        // askpass bridge the migration will use, so a private target reads as
+        // `Empty` rather than `Inaccessible`. The probe itself decides whether
+        // it can authenticate — a stub ignores the credential.
+        let target_credential = self.target_git_credential();
+        let askpass = std::env::current_exe().ok();
+        let state = probe.probe_authenticated(
+            &target_url,
+            target_credential.as_ref(),
+            askpass.as_deref(),
+        )?;
 
         let mut inner = self.lock();
         let existing = snapshot::read_repositories(&inner.store)
@@ -1321,6 +1332,29 @@ impl AppState {
         let inner = self.lock();
         snapshot::read_connections(&inner.store)
             .map_err(|error| errors::store("connection", &error))
+    }
+
+    /// The Git-level credential of the saved target connection, if it has one.
+    ///
+    /// Only ids and names cross here; the askpass program reads the token from
+    /// the credential store when Git actually asks for it.
+    fn target_git_credential(&self) -> Option<RemoteCredential> {
+        let connection = self
+            .connections()
+            .ok()?
+            .into_iter()
+            .find(|connection| connection.role == ConnectionRole::Target)?;
+        let credential_ref = connection.credential_ref.as_deref()?.trim();
+        if credential_ref.is_empty() {
+            return None;
+        }
+        Some(RemoteCredential {
+            credential_ref: credential_ref.to_owned(),
+            username: git_credentials::basic_auth_username(
+                connection.platform,
+                connection.account_name.as_deref(),
+            ),
+        })
     }
 
     pub fn repositories(&self) -> Result<Vec<RepositorySnapshot>, IpcError> {

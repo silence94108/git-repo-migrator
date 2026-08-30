@@ -37,6 +37,20 @@ impl Clock for SystemClock {
 /// plan instead of silently defaulting to a write.
 pub trait TargetProbe: Send + Sync {
     fn probe(&self, target_url: &str) -> Result<TargetState, IpcError>;
+
+    /// Probes with the target connection's Git credential, when it has one.
+    ///
+    /// The default ignores the credential — test doubles never touch a network,
+    /// so they keep answering from their fixture. Only the real `ls-remote`
+    /// probe needs to authenticate, and only for an HTTP target.
+    fn probe_authenticated(
+        &self,
+        target_url: &str,
+        _credential: Option<&git_repo_migrator_platform_core::git_credentials::RemoteCredential>,
+        _askpass_program: Option<&Path>,
+    ) -> Result<TargetState, IpcError> {
+        self.probe(target_url)
+    }
 }
 
 /// `git ls-remote` based probe. Works for every Git host without an API and
@@ -53,14 +67,19 @@ impl GitLsRemoteProbe {
             timeout: Duration::from_secs(30),
         })
     }
-}
 
-impl TargetProbe for GitLsRemoteProbe {
-    fn probe(&self, target_url: &str) -> Result<TargetState, IpcError> {
+    fn ls_remote(
+        &self,
+        target_url: &str,
+        auth: Option<&BTreeMap<String, String>>,
+    ) -> Result<TargetState, IpcError> {
         let mut env = BTreeMap::new();
         // Never let Git open an interactive credential prompt from a GUI child
         // process; an unauthenticated probe must fail fast instead.
         env.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
+        if let Some(auth) = auth {
+            env.extend(auth.clone());
+        }
         let args = [
             "ls-remote".to_owned(),
             "--".to_owned(),
@@ -103,6 +122,35 @@ impl TargetProbe for GitLsRemoteProbe {
                 "请确认目标地址可达并已配置 Windows 凭据后重试",
             )),
         }
+    }
+}
+
+impl TargetProbe for GitLsRemoteProbe {
+    fn probe(&self, target_url: &str) -> Result<TargetState, IpcError> {
+        self.ls_remote(target_url, None)
+    }
+
+    fn probe_authenticated(
+        &self,
+        target_url: &str,
+        credential: Option<&git_repo_migrator_platform_core::git_credentials::RemoteCredential>,
+        askpass_program: Option<&Path>,
+    ) -> Result<TargetState, IpcError> {
+        // Only an HTTP remote can use the askpass bridge; everything else
+        // probes anonymously exactly as before.
+        let lowered = target_url.trim().to_ascii_lowercase();
+        let auth = if lowered.starts_with("http://") || lowered.starts_with("https://") {
+            credential
+                .zip(askpass_program)
+                .map(|(credential, program)| {
+                    git_repo_migrator_platform_core::git_credentials::askpass_env(
+                        program, credential,
+                    )
+                })
+        } else {
+            None
+        };
+        self.ls_remote(target_url, auth.as_ref())
     }
 }
 
