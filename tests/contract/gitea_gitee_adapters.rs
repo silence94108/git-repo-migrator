@@ -53,12 +53,20 @@ fn forgejo_identity_and_version_snapshot_are_preserved() {
     let matrix = block_on(GiteaAdapter.capabilities(&ctx)).unwrap();
     assert_eq!(matrix.platform, PlatformKind::Forgejo);
     assert_eq!(matrix.instance_version.as_deref(), Some("9.0.1"));
-    assert_eq!(matrix.pull_requests.fidelity, Fidelity::NativeRebuild);
+    // Issues is the one module wired to a real migration; everything else says
+    // so instead of promising a fidelity nothing performs.
+    assert_eq!(matrix.issues.fidelity, Fidelity::NativeRebuild);
+    assert_eq!(matrix.pull_requests.fidelity, Fidelity::Unsupported);
+    assert!(matrix
+        .pull_requests
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("未实现")));
     assert!(is_private_ref("refs/pull/3/head"));
 }
 
 #[test]
-fn gitee_capabilities_expose_field_level_degradation() {
+fn gitee_capabilities_state_plainly_which_modules_are_not_migrated() {
     let transport = FixtureTransport {
         responses: Mutex::new(VecDeque::new()),
         config: HttpTransportConfig::default(),
@@ -74,8 +82,10 @@ fn gitee_capabilities_expose_field_level_degradation() {
         transport: &transport,
     };
     let matrix = block_on(GiteeAdapter.capabilities(&ctx)).unwrap();
-    assert_eq!(matrix.pull_requests.fidelity, Fidelity::ReadOnlyArchive);
-    assert!(matrix.pull_requests.degradation.is_some());
+    // No Gitee data module performs a migration in this version; the matrix
+    // says exactly that instead of an optimistic fidelity.
+    assert_eq!(matrix.pull_requests.fidelity, Fidelity::Unsupported);
+    assert!(matrix.pull_requests.reason.is_some());
     assert_eq!(matrix.wiki.fidelity, Fidelity::Unsupported);
     assert!(!matrix.repository_creation.required_scopes.is_empty());
 }

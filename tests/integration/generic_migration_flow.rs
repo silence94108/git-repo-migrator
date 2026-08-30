@@ -11,14 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use git_repo_migrator_application::archive::{ArchiveDocument, ArchiveItem};
 use git_repo_migrator_application::executor::{
     ExecutionAction, ExecutionStage, ModuleGateway, ModuleReport, StageExecutor, StageRecorder,
-    TargetGateway, TaskAssignment,
+    TargetGateway, TaskAssignment, TaskCompletion, TempDirOutcome, WorkspacePolicy,
 };
 use git_repo_migrator_application::orchestrator::BatchControl;
 use git_repo_migrator_application::planning::TargetState;
 use git_repo_migrator_application::report::{ExportFormat, Report, ReportRow};
-use git_repo_migrator_application::verification::{AggregateStatus, VerificationResult};
+use git_repo_migrator_application::verification::AggregateStatus;
 use git_repo_migrator_application::IpcError;
 use git_repo_migrator_domain::{ErrorCategory, Fidelity, ModuleSelection, RefPolicy};
 use git_repo_migrator_git_runner::{GitRunner, RunOptions};
@@ -94,6 +95,45 @@ fn empty_bare(runner: &GitRunner, root: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// A source repository whose working tree holds one LFS-tracked binary. The
+/// file content has to look like a pointer on disk only *after* `git add`
+/// clean-filtering; the raw bytes are what LFS stores server-side.
+fn lfs_source_repository(runner: &GitRunner, root: &Path) -> PathBuf {
+    let work = root.join("lfs-work");
+    let bare = root.join("lfs-source.git");
+    fs::create_dir_all(&work).expect("work dir");
+
+    run(runner, &work, &["init", "-b", "main"]);
+    run(runner, &work, &["config", "user.name", "Migrator Test"]);
+    run(
+        runner,
+        &work,
+        &["config", "user.email", "migrator@example.test"],
+    );
+    fs::write(
+        work.join(".gitattributes"),
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .expect("gitattributes");
+    // LFS rejects content that already looks like a pointer file, so the blob
+    // must carry ordinary binary bytes before the clean filter runs.
+    fs::write(work.join("asset.bin"), [7_u8; 4096]).expect("lfs asset");
+    run(runner, &work, &["add", ".gitattributes", "asset.bin"]);
+    run(runner, &work, &["commit", "-m", "lfs fixture"]);
+    run(
+        runner,
+        root,
+        &["init", "--bare", bare.to_str().expect("path")],
+    );
+    run(
+        runner,
+        &work,
+        &["remote", "add", "origin", bare.to_str().expect("path")],
+    );
+    run(runner, &work, &["push", "origin", "refs/heads/main"]);
+    bare
+}
+
 fn ref_tips(runner: &GitRunner, repo: &Path) -> BTreeMap<String, String> {
     run(
         runner,
@@ -133,9 +173,9 @@ fn assignment(source: &Path, target: &Path, action: ExecutionAction) -> TaskAssi
 struct Recorder {
     stages: Mutex<Vec<String>>,
     modules: Mutex<Vec<ModuleReport>>,
-    completions: Mutex<Vec<VerificationResult>>,
+    completions: Mutex<Vec<TaskCompletion>>,
     failures: Mutex<Vec<(String, IpcError)>>,
-    cleanups: Mutex<Vec<(String, Option<String>)>>,
+    cleanups: Mutex<Vec<(String, TempDirOutcome)>>,
     control: Mutex<BatchControl>,
 }
 
@@ -159,13 +199,13 @@ impl Recorder {
     fn set_control(&self, control: BatchControl) {
         *self.control.lock().expect("control") = control;
     }
-    fn cleanups(&self) -> Vec<(String, Option<String>)> {
+    fn cleanups(&self) -> Vec<(String, TempDirOutcome)> {
         self.cleanups.lock().expect("cleanups").clone()
     }
     fn modules(&self) -> Vec<ModuleReport> {
         self.modules.lock().expect("modules").clone()
     }
-    fn completion(&self) -> Option<VerificationResult> {
+    fn completion(&self) -> Option<TaskCompletion> {
         self.completions
             .lock()
             .expect("completions")
@@ -220,12 +260,12 @@ impl StageRecorder for Recorder {
         &self,
         _task_id: &str,
         _owner: &str,
-        result: &VerificationResult,
+        completion: &TaskCompletion,
     ) -> Result<(), IpcError> {
         self.completions
             .lock()
             .expect("completions")
-            .push(result.clone());
+            .push(completion.clone());
         Ok(())
     }
 
@@ -233,11 +273,11 @@ impl StageRecorder for Recorder {
         *self.control.lock().expect("control")
     }
 
-    fn cleanup(&self, task_id: &str, path: &Path, failure: Option<&str>) {
-        self.cleanups.lock().expect("cleanups").push((
-            format!("{task_id}:{}", path.display()),
-            failure.map(str::to_owned),
-        ));
+    fn cleanup(&self, task_id: &str, path: &Path, outcome: TempDirOutcome) {
+        self.cleanups
+            .lock()
+            .expect("cleanups")
+            .push((format!("{task_id}:{}", path.display()), outcome));
     }
 }
 
@@ -304,7 +344,8 @@ impl TargetGateway for LocalTarget {
     }
 }
 
-/// Reports a module that only exists as a read-only archive.
+/// Reports a module that only exists as a read-only archive, complete with the
+/// document the executor is expected to persist.
 struct ArchiveOnlyModules;
 
 impl ModuleGateway for ArchiveOnlyModules {
@@ -316,6 +357,23 @@ impl ModuleGateway for ArchiveOnlyModules {
             target_count: 0,
             source_links: vec!["https://git.source.test/ops/alpha/issues/1".into()],
             error: None,
+            archive: Some(ArchiveDocument::new(
+                "",
+                "",
+                "ops/alpha",
+                git_repo_migrator_platform_core::PlatformModule::Issues,
+                vec![ArchiveItem {
+                    source_id: "1".into(),
+                    source_url: "https://git.source.test/ops/alpha/issues/1".into(),
+                    title: "崩溃后镜像残留".into(),
+                    body: "重启批次后残留目录未被清理".into(),
+                    source_author: "alice".into(),
+                    state: "open".into(),
+                    attachments: vec![],
+                    metadata: Default::default(),
+                }],
+            )),
+            unmapped_fields: vec!["reactions".into(), "sprints".into()],
         })
     }
 }
@@ -327,6 +385,25 @@ fn executor(
 ) -> StageExecutor {
     StageExecutor::new(
         git(),
+        Workspace::new(workspace_root).expect("workspace"),
+        recorder,
+        "test-worker",
+    )
+    .with_target_gateway(target)
+    .with_min_free_bytes(1)
+}
+
+/// Same as `executor`, but the runner carries the LFS executable so the
+/// `lfs push` stage actually reaches `git-lfs` instead of refusing on the
+/// allowlist.
+fn lfs_capable_executor(
+    workspace_root: &Path,
+    recorder: Arc<Recorder>,
+    target: Arc<dyn TargetGateway>,
+    runner: GitRunner,
+) -> StageExecutor {
+    StageExecutor::new(
+        runner,
         Workspace::new(workspace_root).expect("workspace"),
         recorder,
         "test-worker",
@@ -390,7 +467,9 @@ fn an_empty_target_is_reused_and_only_allowlisted_refs_are_pushed() {
         "only the stages the plan selected may run"
     );
     assert_eq!(
-        recorder.completion().map(|result| result.status),
+        recorder
+            .completion()
+            .map(|result| result.verification.status),
         Some(AggregateStatus::Succeeded),
         "the backend, not the renderer, records the terminal state"
     );
@@ -423,7 +502,11 @@ fn the_workspace_is_cleaned_after_a_successful_repository() {
     );
     let cleanups = recorder.cleanups();
     assert_eq!(cleanups.len(), 1);
-    assert_eq!(cleanups[0].1, None, "cleanup must not report a failure");
+    assert_eq!(
+        cleanups[0].1,
+        TempDirOutcome::Cleaned,
+        "cleanup must not report a failure"
+    );
     assert!(recorder.modules().is_empty(), "no module was selected");
 }
 
@@ -572,13 +655,15 @@ fn a_read_only_archive_module_downgrades_the_result_to_partial() {
     let runner = git();
     let source = source_repository(&runner, temp.path());
     let target = empty_bare(&runner, temp.path(), "target.git");
+    let root = workspace_root(temp.path());
 
     let mut task = assignment(&source, &target, ExecutionAction::ReuseEmpty);
     task.modules.issues = true;
 
+    let recorder = Arc::new(Recorder::default());
     let execution = executor(
-        &workspace_root(temp.path()),
-        Arc::new(Recorder::default()),
+        &root,
+        Arc::clone(&recorder),
         Arc::new(LocalTarget::new(false)),
     )
     .with_module_gateway(Arc::new(ArchiveOnlyModules))
@@ -595,6 +680,39 @@ fn a_read_only_archive_module_downgrades_the_result_to_partial() {
     assert_eq!(modules[0].module, "issues");
     assert_eq!(modules[0].fidelity, Fidelity::ReadOnlyArchive);
     assert_eq!(modules[0].target_count, 0);
+
+    // The archive itself must reach the disk, bound to this batch and task,
+    // and the completion must point at its directory (FR-011/CM-008).
+    let archive_path = root
+        .join("archives")
+        .join("batch-1")
+        .join("task-1")
+        .join("issues.json");
+    let contents = fs::read_to_string(&archive_path).unwrap_or_else(|error| {
+        panic!(
+            "archive must be persisted ({}): {error}",
+            archive_path.display()
+        )
+    });
+    assert!(contents.contains("https://git.source.test/ops/alpha/issues/1"));
+    assert_eq!(
+        recorder
+            .completion()
+            .and_then(|completion| completion.archive_dir),
+        Some("archives/batch-1/task-1".to_owned()),
+        "the report must mark where the archive lives"
+    );
+    assert_eq!(
+        recorder
+            .completion()
+            .map(|completion| completion.unmapped_fields),
+        Some(vec!["reactions".to_owned(), "sprints".to_owned()]),
+        "unmapped source fields flow into the completion"
+    );
+    assert!(
+        modules[0].archive.as_ref().expect("bound archive").task_id == "task-1",
+        "the executor binds the archive to the task, not to the adapter's placeholder ids"
+    );
 }
 
 #[test]
@@ -625,6 +743,85 @@ fn lfs_without_the_tool_degrades_instead_of_claiming_success() {
     assert!(
         lfs.error.is_some(),
         "a missing tool must be visible in the report"
+    );
+}
+
+/// R-9: the LFS success path with a real `git-lfs`. The fixture's pointer is
+/// fetched from the source and pushed to the target, and the report counts the
+/// object that actually moved — not a number LFS printed (it prints nothing on
+/// stdout for `fetch`/`push --all`).
+#[test]
+fn lfs_objects_travel_to_the_target_when_the_tool_is_present() {
+    // The absence of git-lfs is a supported environment; that case is covered
+    // above, so this test skips itself instead of failing there.
+    let Ok(runner) = git().clone().with_lfs(if cfg!(windows) {
+        "git-lfs.exe"
+    } else {
+        "git-lfs"
+    }) else {
+        eprintln!("git-lfs not found; skipping the LFS success-path test");
+        return;
+    };
+
+    let temp = tempfile::tempdir().expect("temp");
+    let source = lfs_source_repository(&runner, temp.path());
+    let target = empty_bare(&runner, temp.path(), "lfs-target.git");
+
+    let mut task = assignment(&source, &target, ExecutionAction::ReuseEmpty);
+    task.modules.lfs = true;
+
+    let recorder = Arc::new(Recorder::default());
+    let execution = lfs_capable_executor(
+        &workspace_root(temp.path()),
+        Arc::clone(&recorder),
+        Arc::new(LocalTarget::new(false)),
+        runner.clone(),
+    )
+    .with_lfs(true)
+    .run(&task);
+
+    assert_eq!(
+        execution.error, None,
+        "the LFS round trip must not fail the task"
+    );
+    assert_eq!(execution.status, AggregateStatus::Succeeded);
+
+    let lfs = execution
+        .modules
+        .iter()
+        .find(|report| report.module == "lfs")
+        .expect("lfs module result");
+    assert_eq!(lfs.fidelity, Fidelity::NativeRebuild);
+    assert_eq!(lfs.source_count, 1, "one LFS object was counted");
+    assert_eq!(lfs.target_count, 1);
+    assert_eq!(lfs.error, None);
+
+    // The object must genuinely live in the target's LFS store, not merely in
+    // the (now deleted) mirror: verify through a fresh clone of the target.
+    // The clone pins `main` because a bare target's HEAD still points at the
+    // `init` default, and the pull takes no argument — a path argument would
+    // be looked up as a remote *name* instead of a URL.
+    let checkout = temp.path().join("verification");
+    fs::create_dir_all(&checkout).expect("checkout dir");
+    run(
+        &runner,
+        &checkout,
+        &[
+            "clone",
+            "-b",
+            "main",
+            "--",
+            target.to_str().expect("target path"),
+            "verify",
+        ],
+    );
+    let verify_dir = checkout.join("verify");
+    run(&runner, &verify_dir, &["lfs", "pull"]);
+    let content = fs::read(verify_dir.join("asset.bin")).expect("restored asset");
+    assert_eq!(
+        content,
+        vec![7_u8; 4096],
+        "the restored bytes must be the original object, not the pointer"
     );
 }
 
@@ -701,6 +898,125 @@ fn an_unreachable_source_fails_retryably_without_touching_the_target() {
     assert_eq!(error.stage, "git");
     assert!(!error.safe_message.is_empty() && !error.action.is_empty());
     assert!(ref_tips(&runner, &target).is_empty());
+}
+
+#[test]
+fn a_failed_task_under_reuse_policy_retains_the_mirror_and_the_report_marks_it() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runner = git();
+    let target = empty_bare(&runner, temp.path(), "target.git");
+    let missing_source = temp.path().join("no-such-source.git");
+    let root = workspace_root(temp.path());
+
+    let recorder = Arc::new(Recorder::default());
+    let execution = executor(
+        &root,
+        Arc::clone(&recorder),
+        Arc::new(LocalTarget::new(false)),
+    )
+    .run(&assignment(
+        &missing_source,
+        &target,
+        ExecutionAction::ReuseEmpty,
+    ));
+
+    // A missing source classifies as `git.not_found` (Conflict), whose terminal
+    // state is Skipped: the operator must fix the address, not wait for a
+    // retry. The retention below is what happens to the workspace either way.
+    assert_eq!(execution.status, AggregateStatus::Skipped);
+    let leftovers: Vec<_> = fs::read_dir(&root)
+        .expect("workspace listing")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+        .collect();
+    assert!(
+        !leftovers.is_empty(),
+        "the default Reuse policy keeps the failed mirror for inspection"
+    );
+    let cleanups = recorder.cleanups();
+    assert_eq!(cleanups.len(), 1);
+    assert_eq!(
+        cleanups[0].1,
+        TempDirOutcome::Retained,
+        "a deliberate retention is an outcome, not a missing cleanup"
+    );
+}
+
+#[test]
+fn a_failed_task_under_clean_policy_deletes_the_mirror() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runner = git();
+    let target = empty_bare(&runner, temp.path(), "target.git");
+    let missing_source = temp.path().join("no-such-source.git");
+    let root = workspace_root(temp.path());
+
+    let recorder = Arc::new(Recorder::default());
+    let execution = executor(
+        &root,
+        Arc::clone(&recorder),
+        Arc::new(LocalTarget::new(false)),
+    )
+    .with_workspace_policy(WorkspacePolicy::Clean)
+    .run(&assignment(
+        &missing_source,
+        &target,
+        ExecutionAction::ReuseEmpty,
+    ));
+
+    // Same classification as above: a missing source ends Skipped, and the
+    // Clean policy still deletes the failed attempt's mirror.
+    assert_eq!(execution.status, AggregateStatus::Skipped);
+    let leftovers: Vec<_> = fs::read_dir(&root)
+        .expect("workspace listing")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the Clean policy deletes the mirror even after a failure: {leftovers:?}"
+    );
+    assert_eq!(
+        recorder.cleanups()[0].1,
+        TempDirOutcome::Cleaned,
+        "the mirror went away, so the outcome is a plain cleanup"
+    );
+}
+
+#[test]
+fn a_resumed_task_under_clean_policy_purges_stale_directories_of_the_same_task() {
+    let temp = tempfile::tempdir().expect("temp");
+    let runner = git();
+    let source = source_repository(&runner, temp.path());
+    let target = empty_bare(&runner, temp.path(), "target.git");
+    let root = workspace_root(temp.path());
+
+    // A crashed earlier attempt of task-1 left its mirror behind.
+    let stale = root.join(".tmp-task-1-crash-leftover");
+    fs::create_dir_all(&stale).expect("stale dir");
+    fs::write(stale.join("packed-refs"), "stale\n").expect("stale marker");
+    // Another task's leftover must survive: only this task's dirs are purged.
+    let other_task = root.join(".tmp-task-2-other");
+    fs::create_dir_all(&other_task).expect("other task dir");
+
+    let mut task = assignment(&source, &target, ExecutionAction::ReuseEmpty);
+    task.resumed_attempt = true;
+    let execution = executor(
+        &root,
+        Arc::new(Recorder::default()),
+        Arc::new(LocalTarget::new(false)),
+    )
+    .with_workspace_policy(WorkspacePolicy::Clean)
+    .run(&task);
+
+    assert_eq!(execution.error, None);
+    assert!(
+        !stale.exists(),
+        "the resumed attempt must purge this task's stale mirror before cloning"
+    );
+    assert!(
+        other_task.exists(),
+        "purging may never touch another task's directories"
+    );
 }
 
 #[test]

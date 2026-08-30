@@ -26,9 +26,14 @@ fn generated_typescript_contains_contract_matrix_enums() {
     // The authorize payload is the closest thing to a credential command; its
     // shape is pinned so a secret field cannot be added without this failing.
     assert!(generated.contains("export interface ConnectionAuthorizeInput { name: string; }"));
+    // Line endings differ between a CRLF checkout and the LF blob the hash was
+    // taken from, so the digest is computed over the normalised text.
     use sha2::{Digest, Sha256};
     assert_eq!(
-        format!("{:x}", Sha256::digest(generated.as_bytes())),
+        format!(
+            "{:x}",
+            Sha256::digest(generated.replace("\r\n", "\n").as_bytes())
+        ),
         "57237cbed4626d60f0b0a50b6b2dab9f7b335bafba1d2b7c8e4af9466c725007"
     );
 }

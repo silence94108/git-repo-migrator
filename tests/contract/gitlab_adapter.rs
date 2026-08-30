@@ -33,7 +33,7 @@ fn endpoint() -> Endpoint {
 }
 
 #[test]
-fn old_self_managed_version_degrades_merge_requests_to_archive() {
+fn old_self_managed_version_is_reported_and_unimplemented_modules_say_so() {
     let transport = FixtureTransport {
         responses: Mutex::new(
             vec![HttpResponse {
@@ -54,7 +54,10 @@ fn old_self_managed_version_degrades_merge_requests_to_archive() {
     };
     let matrix = block_on(GitlabAdapter.capabilities(&ctx)).unwrap();
     assert_eq!(matrix.instance_version.as_deref(), Some("11.6.2"));
-    assert_eq!(matrix.merge_requests.fidelity, Fidelity::ReadOnlyArchive);
+    // No GitLab data module performs a migration in this version; the matrix
+    // states that instead of promising an archive nothing produces.
+    assert_eq!(matrix.merge_requests.fidelity, Fidelity::Unsupported);
+    assert!(matrix.merge_requests.reason.is_some());
     assert_eq!(matrix.releases.fidelity, Fidelity::Unsupported);
     assert!(is_private_ref("refs/merge-requests/7/head"));
 }
