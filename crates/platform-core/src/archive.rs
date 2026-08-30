@@ -1,4 +1,4 @@
-use git_repo_migrator_platform_core::PlatformModule;
+use crate::PlatformModule;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -90,10 +90,30 @@ impl ArchiveDocument {
     }
 
     pub fn retention_path(&self) -> PathBuf {
+        self.retention_dir()
+            .join(format!("{}.json", module_name(self.module)))
+    }
+
+    /// Directory holding every archive document of this task. Used by the
+    /// executor as the report's archive path.
+    pub fn retention_dir(&self) -> PathBuf {
         PathBuf::from("archives")
             .join(&self.batch_id)
             .join(&self.task_id)
-            .join(format!("{}.json", module_name(self.module)))
+    }
+
+    /// Rebinds a document produced by a platform adapter to the task that will
+    /// persist it: adapters have no batch or task ids of their own.
+    pub fn rebind(
+        mut self,
+        batch_id: impl Into<String>,
+        task_id: impl Into<String>,
+        repository: impl Into<String>,
+    ) -> Self {
+        self.batch_id = safe_segment(batch_id.into());
+        self.task_id = safe_segment(task_id.into());
+        self.repository = repository.into();
+        self
     }
 }
 

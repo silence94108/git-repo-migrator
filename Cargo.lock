@@ -1383,6 +1383,7 @@ name = "git-repo-migrator-platform-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "git-repo-migrator-domain",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod transport;
 
 use async_trait::async_trait;
@@ -70,6 +71,17 @@ pub enum Fidelity {
     NativeRebuild,
     ReadOnlyArchive,
     Unsupported,
+}
+
+impl Fidelity {
+    /// Bridges to the domain crate's identically-shaped enum. The two live in
+    /// separate crates on purpose (adapters must not depend on domain rules);
+    /// their wire values are the shared contract, so the bridge round-trips
+    /// through serde instead of duplicating a match arm list.
+    pub fn to_domain(self) -> git_repo_migrator_domain::Fidelity {
+        serde_json::from_value(serde_json::to_value(self).expect("fidelity serialises"))
+            .expect("wire values agree")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +247,9 @@ pub struct RemoteRepositoryState {
     pub visibility: Option<RepositoryVisibility>,
     pub default_branch: Option<String>,
     pub permissions: Option<RepositoryPermissions>,
+    /// The source description, so a metadata module can carry it to the target.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +307,19 @@ pub struct ModuleResult {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub item_mappings: BTreeMap<String, String>,
+    /// Links back to the source items, so a report can always point at what was
+    /// (or was not) migrated.
+    #[serde(default)]
+    pub source_links: Vec<String>,
+    /// The read-only archive a `ReadOnlyArchive` module produced. `None` for any
+    /// other fidelity: an archive that is not handed over is a contract violation.
+    #[serde(default)]
+    pub archive: Option<archive::ArchiveDocument>,
+    /// Source fields this adapter cannot map onto the target, e.g. `reactions`.
+    /// Flows into the report's unmapped-fields column so the operator can see
+    /// what a "successful" migration still dropped.
+    #[serde(default)]
+    pub unmapped_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,9 +465,23 @@ pub trait PlatformAdapter: Send + Sync {
         metadata: MetadataPatch,
     ) -> Result<ModuleResult, PlatformError>;
 
+    /// The best fidelity this adapter can deliver for `module`, independent of
+    /// any particular instance. `ReadOnlyArchive` needs only a readable source;
+    /// `NativeRebuild` additionally requires the target to sit on an instance of
+    /// the same platform kind.
+    fn module_fidelity(&self, module: PlatformModule) -> Fidelity {
+        let _ = module;
+        Fidelity::Unsupported
+    }
+
+    /// Reads `module`'s items from `source` via `ctx`, and — when the fidelity
+    /// allows it — creates them on `target` via `target_ctx`, an instance of the
+    /// same platform kind. An adapter that can only archive ignores `target_ctx`
+    /// and returns a `ReadOnlyArchive` result carrying the archive document.
     async fn migrate_module(
         &self,
         ctx: &AdapterContext<'_>,
+        target_ctx: &AdapterContext<'_>,
         module: PlatformModule,
         source: &RemoteRepository,
         target: &RemoteRepository,
