@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod dto;
 pub mod errors;
 pub mod events;
+pub mod platform_gateway;
 pub mod ports;
 pub mod runner;
 pub mod snapshot;
@@ -31,7 +32,13 @@ const STORE_FILE: &str = "migration-state.sqlite3";
 /// and inside the per-user app-data directory.
 const WORKSPACE_DIR: &str = "workspace";
 
-fn build_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> (AppState, std::path::PathBuf) {
+fn build_state<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> (
+    AppState,
+    std::path::PathBuf,
+    Arc<git_repo_migrator_credential_store::CredentialStore>,
+) {
     let data_dir = tauri::Manager::path(app)
         .app_data_dir()
         .ok()
@@ -54,11 +61,18 @@ fn build_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> (AppState, std::
     // API discovery goes through the real transport; the credential store is the
     // only thing that ever holds a token, and it is not reachable from a command.
     let credentials = Arc::new(git_repo_migrator_credential_store::CredentialStore::new());
-    let state = state.with_discovery(Arc::new(discovery::ApiDiscoveryGateway::new(credentials)));
+    let state = state.with_discovery(Arc::new(discovery::ApiDiscoveryGateway::new(Arc::clone(
+        &credentials,
+    ))));
+    // Connection testing probes the real platform API: a wrong token or an
+    // unreachable instance is reported as such instead of a canned table.
+    let state = state.with_connection_tester(Arc::new(discovery::ApiConnectionTester::new(
+        Arc::clone(&credentials),
+    )));
     let workspace = data_dir
         .map(|dir| dir.join(WORKSPACE_DIR))
         .unwrap_or_else(|| std::env::temp_dir().join("git-repo-migrator-workspace"));
-    (state, workspace)
+    (state, workspace, credentials)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -66,14 +80,17 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
-            let (state, workspace) = build_state(&handle);
+            let (state, workspace, credentials) = build_state(&handle);
             let state = Arc::new(state);
             // The pool holds a weak handle so the state is not kept alive by
-            // its own workers.
+            // its own workers. It shares the credential store with discovery
+            // and connection testing, so the workers resolve exactly the
+            // references the operator authorised.
             let launcher = Arc::new(runner::ThreadPoolLauncher::new(
                 Arc::downgrade(&state),
                 Arc::new(events::TauriEventSink::new(handle)),
                 workspace,
+                credentials,
             ));
             state.install_launcher(launcher);
             tauri::Manager::manage(app, state);

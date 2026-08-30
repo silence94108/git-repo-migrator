@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use git_repo_migrator_application::planning::TargetState;
 use git_repo_migrator_application::IpcError;
-use git_repo_migrator_domain::ErrorCategory;
+use git_repo_migrator_domain::{ErrorCategory, Fidelity};
 use git_repo_migrator_git_runner::{GitError, GitRunner, RunOptions};
 use git_repo_migrator_platform_core::{DiscoveryQuery, PlatformKind, RepositoryCandidate};
 
@@ -117,6 +117,37 @@ pub trait DiscoveryGateway: Send + Sync {
         credential_ref: Option<&str>,
         query: &DiscoveryQuery,
     ) -> Result<Vec<RepositoryCandidate>, IpcError>;
+}
+
+/// Probes a platform's real API: who the token belongs to, which instance
+/// version answered, and what that instance can actually do. The credential is
+/// resolved inside the transport exactly as in discovery.
+pub trait ConnectionTester: Send + Sync {
+    fn test(
+        &self,
+        endpoint: &str,
+        platform: PlatformKind,
+        credential_ref: Option<&str>,
+    ) -> Result<ConnectionProbe, IpcError>;
+}
+
+/// What a real probe established. The capabilities come from the platform's own
+/// capability matrix, not from a static table.
+pub struct ConnectionProbe {
+    pub account_name: Option<String>,
+    pub instance_version: Option<String>,
+    pub capabilities: Vec<ConnectionCapability>,
+}
+
+/// One row of the probe's capability answer, already flattened for the DTO.
+pub struct ConnectionCapability {
+    pub module: &'static str,
+    pub supported: bool,
+    pub permitted: bool,
+    pub required_scopes: Vec<String>,
+    pub fidelity: Fidelity,
+    pub reason: Option<String>,
+    pub degradation: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

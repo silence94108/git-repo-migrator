@@ -197,6 +197,7 @@ fn fixture(tasks: &[(String, String)], temp: tempfile::TempDir, root: &Path) -> 
         Arc::downgrade(&state),
         events.clone(),
         workspace,
+        Arc::new(git_repo_migrator_credential_store::CredentialStore::in_memory()),
     ));
     state.install_launcher(launcher.clone());
     Fixture {

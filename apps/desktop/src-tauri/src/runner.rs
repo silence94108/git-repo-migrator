@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use git_repo_migrator_application::executor::{
     ExecutionStage, ModuleReport, StageExecutor, StageRecorder, TargetGateway, TaskAssignment,
+    TaskCompletion, TempDirOutcome,
 };
 use git_repo_migrator_application::planning::TargetState;
-use git_repo_migrator_application::verification::{AggregateStatus, VerificationResult};
+use git_repo_migrator_application::verification::AggregateStatus;
 use git_repo_migrator_application::{BatchControl, IpcError};
 use git_repo_migrator_domain::ErrorCategory;
 use git_repo_migrator_git_runner::{GitExecutable, GitRunner, RunOptions};
@@ -161,25 +162,26 @@ impl StageRecorder for AppRecorder {
         &self,
         task_id: &str,
         owner: &str,
-        result: &VerificationResult,
+        completion: &TaskCompletion,
     ) -> Result<(), IpcError> {
+        let verification = &completion.verification;
         let summary = VerifySummary {
-            git_verified: result.git_ok,
-            lfs_verified: result.lfs_ok,
-            metadata_verified: result.metadata_ok,
-            evidence: result.evidence.clone(),
-            unmapped_fields: Vec::new(),
-            archive_path: None,
+            git_verified: verification.git_ok,
+            lfs_verified: verification.lfs_ok,
+            metadata_verified: verification.metadata_ok,
+            evidence: verification.evidence.clone(),
+            unmapped_fields: completion.unmapped_fields.clone(),
+            archive_path: completion.archive_dir.clone(),
             next_action: None,
         };
         self.state
-            .complete_task(task_id, owner, &summary, result.status)?;
+            .complete_task(task_id, owner, &summary, verification.status)?;
         self.events.emit(&events::task_completed(
             self.revision(),
             &self.batch_id,
             task_id,
-            status_text(result.status),
-            result.fidelity.clone(),
+            status_text(verification.status),
+            verification.fidelity.clone(),
         ));
         Ok(())
     }
@@ -188,12 +190,17 @@ impl StageRecorder for AppRecorder {
         self.state.batch_control(batch_id)
     }
 
-    fn cleanup(&self, _task_id: &str, path: &Path, failure: Option<&str>) {
-        let state = match failure {
-            None => CleanupState::Cleaned,
-            Some(reason) => CleanupState::CleanupFailed {
+    fn cleanup(&self, _task_id: &str, path: &Path, outcome: TempDirOutcome) {
+        // FR-011: the report must show what actually happened to the mirror —
+        // including a deliberate retention of a failed attempt's data.
+        let state = match outcome {
+            TempDirOutcome::Cleaned => CleanupState::Cleaned,
+            TempDirOutcome::Retained => CleanupState::RetainedTempDirectory {
                 path: path.display().to_string(),
-                reason: reason.to_owned(),
+            },
+            TempDirOutcome::Failed(reason) => CleanupState::CleanupFailed {
+                path: path.display().to_string(),
+                reason,
             },
         };
         self.state.set_cleanup_state(state);
@@ -213,6 +220,7 @@ pub struct ThreadPoolLauncher {
     state: Weak<AppState>,
     events: Arc<dyn EventSink>,
     workspace_root: PathBuf,
+    credentials: Arc<git_repo_migrator_credential_store::CredentialStore>,
     batches: Mutex<HashMap<String, BatchHandle>>,
 }
 
@@ -221,11 +229,13 @@ impl ThreadPoolLauncher {
         state: Weak<AppState>,
         events: Arc<dyn EventSink>,
         workspace_root: impl Into<PathBuf>,
+        credentials: Arc<git_repo_migrator_credential_store::CredentialStore>,
     ) -> Self {
         Self {
             state,
             events,
             workspace_root: workspace_root.into(),
+            credentials,
             batches: Mutex::new(HashMap::new()),
         }
     }
@@ -271,6 +281,7 @@ impl BatchLauncher for ThreadPoolLauncher {
             let worker = Worker {
                 state: Arc::clone(&state),
                 events: Arc::clone(&self.events),
+                credentials: Arc::clone(&self.credentials),
                 batch_id: batch_id.to_owned(),
                 owner: format!("worker-{batch_id}-{index}"),
                 workspace_root: self.workspace_root.clone(),
@@ -296,30 +307,58 @@ impl BatchLauncher for ThreadPoolLauncher {
     }
 }
 
-/// Target facts for the executor, read with the same `git ls-remote` probe the
-/// preflight page uses. Creation is not wired to a platform API yet, so it
-/// returns an actionable refusal instead of guessing.
+/// Target facts for the executor, read through the target platform's API when a
+/// connection exists, and with `git ls-remote` otherwise (Generic Git has no
+/// API). Creation goes through the same API session.
 struct GitTargetGateway {
     probe: crate::ports::GitLsRemoteProbe,
+    session: Option<crate::platform_gateway::PlatformSession>,
 }
 
 impl TargetGateway for GitTargetGateway {
     fn probe(&self, target_url: &str) -> Result<TargetState, IpcError> {
+        // Only a session with a real adapter answers here: a Generic Git target
+        // must keep the `ls-remote` probe, which is exactly its API.
+        if let Some(session) = self
+            .session
+            .as_ref()
+            .filter(|session| session.has_adapter())
+        {
+            // An API platform answers through its adapter: an unreadable
+            // repository is `Missing`, an auth failure is `Inaccessible`.
+            let gateway = crate::platform_gateway::ApiTargetGateway::new(session.clone());
+            return match gateway.probe(target_url) {
+                Ok(state) => Ok(state),
+                Err(error)
+                    if matches!(
+                        error.category,
+                        ErrorCategory::Auth | ErrorCategory::Permission
+                    ) =>
+                {
+                    Ok(TargetState::Inaccessible)
+                }
+                Err(_) => Ok(TargetState::Unknown),
+            };
+        }
         crate::ports::TargetProbe::probe(&self.probe, target_url)
     }
 
-    fn create(&self, _assignment: &TaskAssignment) -> Result<(), IpcError> {
-        Err(errors::unsupported(
-            "prepare_target",
-            "本版本不会自动创建目标仓库",
-            "请先在目标平台手动建库（保持为空），然后重新预检并选择「复用空仓库」",
-        ))
+    fn create(&self, assignment: &TaskAssignment) -> Result<(), IpcError> {
+        let Some(session) = &self.session else {
+            return Err(errors::unsupported(
+                "prepare_target",
+                "通用 Git 服务没有建库 API",
+                "请先在目标服务手动建库（保持为空），然后重新预检并选择「复用空仓库」",
+            ));
+        };
+        crate::platform_gateway::ApiTargetGateway::new(session.clone()).create(assignment)
     }
 }
 
 struct Worker {
     state: Arc<AppState>,
     events: Arc<dyn EventSink>,
+    credentials: Arc<git_repo_migrator_credential_store::CredentialStore>,
     batch_id: String,
     owner: String,
     workspace_root: PathBuf,
@@ -439,11 +478,63 @@ impl Worker {
         ));
         let mut executor = StageExecutor::new(git, workspace, recorder, self.owner.clone())
             .with_cancel(Arc::clone(&self.cancel))
-            .with_lfs(lfs_available);
+            .with_lfs(lfs_available)
+            .with_workspace_policy(self.state.workspace_policy_of(&self.batch_id));
+
+        // Platform sessions come from the persisted connection rows. A source
+        // without a connection means the operator imported URLs by hand: the
+        // generic session still archives read-only modules. A target without a
+        // connection keeps `None`, which leaves `ls-remote` probing and the honest
+        // "no repository-creation API" refusal.
+        let connections = self.state.connections().unwrap_or_default();
+        let source_session = connections
+            .iter()
+            .find(|connection| connection.role == crate::dto::ConnectionRole::Source)
+            .and_then(|connection| {
+                crate::platform_gateway::PlatformSession::from_connection(
+                    connection,
+                    Arc::clone(&self.credentials),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| {
+                let endpoint = connections
+                    .iter()
+                    .find(|connection| connection.role == crate::dto::ConnectionRole::Source)
+                    .map(|connection| connection.endpoint.clone())
+                    .unwrap_or_default();
+                crate::platform_gateway::PlatformSession::generic(
+                    endpoint,
+                    Arc::clone(&self.credentials),
+                )
+            });
+        let target_session = connections
+            .iter()
+            .find(|connection| connection.role == crate::dto::ConnectionRole::Target)
+            .and_then(|connection| {
+                crate::platform_gateway::PlatformSession::from_connection(
+                    connection,
+                    Arc::clone(&self.credentials),
+                )
+                .ok()
+            });
+        executor =
+            executor.with_module_gateway(Arc::new(crate::platform_gateway::ApiModuleGateway::new(
+                source_session.clone(),
+                target_session.clone().unwrap_or_else(|| {
+                    crate::platform_gateway::PlatformSession::generic(
+                        String::new(),
+                        Arc::clone(&self.credentials),
+                    )
+                }),
+            )));
         // Without a usable probe the executor keeps the target state unknown and
         // blocks before any write, which is the safe direction.
         if let Ok(probe) = crate::ports::GitLsRemoteProbe::system() {
-            executor = executor.with_target_gateway(Arc::new(GitTargetGateway { probe }));
+            executor = executor.with_target_gateway(Arc::new(GitTargetGateway {
+                probe,
+                session: target_session,
+            }));
         }
         Ok(executor)
     }

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use git_repo_migrator_application::executor::{ExecutionAction, TaskAssignment};
+use git_repo_migrator_application::executor::{ExecutionAction, TaskAssignment, WorkspacePolicy};
 use git_repo_migrator_application::ipc_contract::{
     BatchStartInput, ConnectionAuthorizeInput, ConnectionTestInput, ReportExportInput,
     TaskRetryInput,
@@ -46,8 +46,8 @@ use crate::errors;
 use git_repo_migrator_credential_store::prompt::{reference_for, validate_name};
 
 use crate::ports::{
-    BatchLauncher, Clock, CompanionProcessLauncher, DiscoveryGateway, ExportSink, FileExportSink,
-    IdentityEntryLauncher, SystemClock, TargetProbe, TransportNotWired,
+    BatchLauncher, Clock, CompanionProcessLauncher, ConnectionTester, DiscoveryGateway, ExportSink,
+    FileExportSink, IdentityEntryLauncher, SystemClock, TargetProbe, TransportNotWired,
 };
 use crate::snapshot::{self, CandidateDetails, ConnectionDetails, PlanSelection, VerifySummary};
 
@@ -135,6 +135,9 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     probe: Option<Arc<dyn TargetProbe>>,
     discovery: Arc<dyn DiscoveryGateway>,
+    /// Real network probe for `connection_test`. Absent in tests, which keep the
+    /// static table so no test ever depends on a live platform.
+    connection_tester: Option<Arc<dyn crate::ports::ConnectionTester>>,
     export: Arc<dyn ExportSink>,
     identity_entry: Arc<dyn IdentityEntryLauncher>,
     /// Installed after construction, because the worker pool needs a handle to
@@ -165,6 +168,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             probe: None,
             discovery: Arc::new(TransportNotWired),
+            connection_tester: None,
             export: Arc::new(FileExportSink),
             identity_entry: Arc::new(CompanionProcessLauncher),
             launcher: Mutex::new(None),
@@ -183,6 +187,11 @@ impl AppState {
 
     pub fn with_discovery(mut self, discovery: Arc<dyn DiscoveryGateway>) -> Self {
         self.discovery = discovery;
+        self
+    }
+
+    pub fn with_connection_tester(mut self, tester: Arc<dyn ConnectionTester>) -> Self {
+        self.connection_tester = Some(tester);
         self
     }
 
@@ -268,6 +277,24 @@ impl AppState {
         let platform = input.platform_hint.unwrap_or(PlatformKind::Unknown);
         validate_endpoint(&input.endpoint)?;
         validate_credential_ref(input.credential_ref.as_deref())?;
+        // With a wired tester the platform itself answers: a wrong token
+        // surfaces as an auth error instead of an optimistic capability table.
+        if let Some(tester) = &self.connection_tester {
+            let probe = tester.test(&input.endpoint, platform, input.credential_ref.as_deref())?;
+            return Ok(probe
+                .capabilities
+                .into_iter()
+                .map(|capability| CapabilitySummary {
+                    module: capability.module.to_owned(),
+                    supported: capability.supported,
+                    permitted: capability.permitted,
+                    required_scopes: capability.required_scopes,
+                    fidelity: capability.fidelity,
+                    reason: capability.reason,
+                    degradation: capability.degradation,
+                })
+                .collect());
+        }
         Ok(capabilities_for(platform))
     }
 
@@ -991,9 +1018,9 @@ impl AppState {
             .store
             .connection()
             .execute(
-                "INSERT INTO batch (id, plan_id, status, total, completed, failed, started_at_ms)
-                 VALUES (?1, ?2, 'running', ?3, 0, 0, ?4)",
-                params![batch_id, input.plan_id, total, now],
+                "INSERT INTO batch (id, plan_id, status, total, completed, failed, started_at_ms, workspace_policy)
+                 VALUES (?1, ?2, 'running', ?3, 0, 0, ?4, ?5)",
+                params![batch_id, input.plan_id, total, now, input.workspace_policy],
             )
             .map_err(|error| errors::store("queue", &error.into()))?;
 
@@ -1226,9 +1253,16 @@ impl AppState {
             .map_err(|error| errors::store("report", &error))
     }
 
+    /// Records what happened to a task's temporary directory (FR-011).
+    ///
+    /// The report carries one batch-level cleanup line, so per-task outcomes are
+    /// folded together: a deliberate retention outranks everything (the operator
+    /// must learn where the mirror lives), a failed cleanup outranks a clean
+    /// one, and the first retained path is kept — losing it would hide exactly
+    /// the directory the operator asked to keep.
     pub fn set_cleanup_state(&self, cleanup: CleanupState) {
         let mut inner = self.lock();
-        inner.cleanup = cleanup;
+        inner.cleanup = merge_cleanup(&inner.cleanup, cleanup);
         inner.revision += 1;
     }
 
@@ -1386,14 +1420,14 @@ impl AppState {
             .store
             .connection()
             .query_row(
-                "SELECT status FROM batch WHERE id = ?1",
+                "SELECT status, workspace_policy FROM batch WHERE id = ?1",
                 params![batch_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(|error| errors::store("queue", &error.into()))?
             .ok_or_else(|| errors::not_found("queue", "批次"))?;
-        if snapshot::parse_control(&status) != BatchControl::Running {
+        if snapshot::parse_control(&status.0) != BatchControl::Running {
             return Ok(None);
         }
 
@@ -1487,6 +1521,25 @@ impl AppState {
             allow_overwrite: policy.allow_overwrite,
             resumed_attempt,
         }))
+    }
+
+    /// The workspace policy a batch was started with (FR-011). Workers read it
+    /// once per claim so a resumed batch keeps the policy its operator chose.
+    pub fn workspace_policy_of(&self, batch_id: &str) -> WorkspacePolicy {
+        let inner = self.lock();
+        let policy = inner
+            .store
+            .connection()
+            .query_row(
+                "SELECT workspace_policy FROM batch WHERE id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "reuse".to_owned());
+        WorkspacePolicy::parse(&policy).unwrap_or(WorkspacePolicy::Reuse)
     }
 
     pub fn begin_stage(
@@ -2096,6 +2149,20 @@ fn capability_fingerprint(target: Option<&ConnectionSnapshot>) -> String {
         ),
     );
     parts.join("|")
+}
+
+/// Folds a per-task cleanup outcome into the batch-level report line (FR-011):
+/// retention outranks a failed cleanup, which outranks a clean one, and the
+/// first retained path is never overwritten by a later outcome.
+fn merge_cleanup(current: &CleanupState, next: CleanupState) -> CleanupState {
+    use CleanupState::*;
+    match (current, next) {
+        (RetainedTempDirectory { .. }, _) => current.clone(),
+        (_, retained @ RetainedTempDirectory { .. }) => retained,
+        (CleanupFailed { .. }, _) => current.clone(),
+        (_, failed @ CleanupFailed { .. }) => failed,
+        (Cleaned, Cleaned) => Cleaned,
+    }
 }
 
 fn module_fidelity_rows(
